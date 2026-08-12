@@ -10,3 +10,6 @@ venv/
 
 # internal idea/history doc - never shipped
 IDEA.txt
+
+# local agent-memory store - never shipped
+.agent/

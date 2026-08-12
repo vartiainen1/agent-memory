@@ -24,6 +24,42 @@ memory, but the AI must not have unrestricted authority over memory.**
 - **Agent- and model-agnostic** — a boring, deterministic CLI any agent can
   drive; works with zero LLM calls.
 
+## Why isn't this just RAG?
+
+RAG retrieves *source text* (docs, code) and lets an LLM do the rest.
+agent-memory stores *curated, typed knowledge about the project* — what was
+decided, what broke before, what the constraints are — and, critically,
+**who is allowed to create, trust, and modify that knowledge**:
+
+- Memories are born `untrusted`; only a human can promote them.
+- Nothing is ever rewritten: history is superseded, never edited.
+- Every create/access/delete is written to an append-only audit log.
+- Secrets are detected and rejected before storage.
+
+A vector database answers *"what text is similar to this query?"* — it has no
+opinion on whether the answer is *true*, *trusted*, or *current*. That is the
+problem agent-memory is built around.
+
+## Install
+
+Requires Python >= 3.11. Zero runtime dependencies.
+
+```bash
+# from this repository (the current distribution path - not yet on PyPI)
+pip install git+https://github.com/vartiainen1/agent-memory.git
+
+# or clone and install locally
+git clone https://github.com/vartiainen1/agent-memory.git
+cd agent-memory
+pip install .
+```
+
+Verify:
+
+```bash
+agent-memory --version   # agent-memory 0.1.0
+```
+
 ## Quickstart
 
 ```bash
@@ -62,6 +98,37 @@ agent-memory recall "auth" --path src/auth/login.py
 Exit codes: `0` success · `1` runtime error · `2` usage error.
 Every command supports `--json` for machine-readable output.
 
+## How an AI agent uses it
+
+An agent asks *"what should I know before doing this task?"* — it does **not**
+get unrestricted access to the store:
+
+```bash
+agent-memory recall "modify authentication" --path src/auth/login.py --json
+```
+
+```json
+{
+  "results": [
+    {
+      "id": "mem_...",
+      "type": "constraint",
+      "title": "Authentication must use AuthService",
+      "trust": "approved",
+      "content": "All authentication logic must use AuthService",
+      "paths": ["src/auth/**"]
+    }
+  ],
+  "count": 1
+}
+```
+
+By default `recall` only returns `active` memories that are **not untrusted**,
+so an agent cannot be steered by unverified or superseded knowledge. `promote`
+is a human-only command; there is no agent-accessible path to raise trust or
+alter history. Everything the agent reads or the system mutates is recorded in
+`audit.jsonl`.
+
 ## Storage layout
 
 ```
@@ -89,6 +156,13 @@ v0.1.
 - **Immutable history:** superseding sets bidirectional links
   (`supersedes` / `superseded_by`); historical records are retained.
 - **Audit:** every mutation and access writes an append-only event.
+
+## What happens to your data
+
+Everything lives in `.agent/` inside your own project. Nothing is uploaded,
+synced, or sent anywhere — agent-memory makes **zero network calls**. It runs
+on Python's standard library only. Delete the `.agent/` directory and every
+memory is gone; there is no server, no account, and no cloud copy.
 
 ## Ecosystem role
 
