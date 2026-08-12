@@ -91,7 +91,7 @@ agent-memory recall "auth" --path src/auth/login.py
 | `search QUERY [--type T] [--status S] [--limit N] [--json]` | operator textual search (limit 50) |
 | `recall QUERY [--path P] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only) |
 | `promote <mem_id> --trust verified\|approved` | human trust promotion (never `system`) |
-| `import PATH --source error-log\|decision-log` | family import (untrusted, provenance-tracked, idempotent) |
+| `import PATH --source error-log\|decision-log\|lesson-log` | family import (untrusted, provenance-tracked, idempotent) |
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
 | `status [--json]` | store health + counts |
@@ -145,6 +145,7 @@ starting empty:
 agent-memory init
 agent-memory import ../agent-error-log --source error-log
 agent-memory import ../agent-decision-log --source decision-log
+agent-memory import ../agent-log-ai --source lesson-log   # AI-derived lesson drafts
 agent-memory list            # imported memories (untrusted)
 agent-memory promote <id> --trust approved   # human-curate what the agent may recall
 ```
@@ -225,7 +226,7 @@ manual via `add --provenance import`.)
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (187 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (218 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
 ```
 

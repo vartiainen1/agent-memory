@@ -64,9 +64,11 @@ DEFAULT_SEARCH_LIMIT = 50
 PATH_BONUS = 10
 
 # Family import (V0.1_SPEC.md section 14, v0.2 Tier 2.3 - EVIDENCE-003/016).
-IMPORT_SOURCES = ("error-log", "decision-log")
-IMPORT_REPOS = {"error-log": "agent-error-log", "decision-log": "agent-decision-log"}
-IMPORT_LOG_FILES = {"error-log": "errors.txt", "decision-log": "decisions.txt"}
+IMPORT_SOURCES = ("error-log", "decision-log", "lesson-log")
+IMPORT_REPOS = {"error-log": "agent-error-log", "decision-log": "agent-decision-log",
+               "lesson-log": "agent-log-ai"}
+IMPORT_LOG_FILES = {"error-log": "errors.txt", "decision-log": "decisions.txt",
+                   "lesson-log": "rules.txt"}
 
 # Secret detection (V0.1_SPEC.md section 5) - best-effort, documented imperfect.
 SECRET_PATTERNS = [
@@ -795,6 +797,12 @@ _ERROR_ENTRY_RE = re.compile(r"^\[(?P<tag>[^\]]+)\] AREA: (?P<area>.+)$")
 _DECISION_ENTRY_RE = re.compile(r"^\[(?P<tag>[^\]]+)\] DECISION: (?P<title>.+)$")
 _IMPORT_FIELD_RE = re.compile(r"^  (?P<field>[A-Z]+):\s*(?P<value>.*)$")
 _SECTION_SEP_RE = re.compile(r"^={4,}$")
+_LESSON_CLUSTER_RE = re.compile(
+    r"^\*{0,2}\s*CLUSTER\s+(?P<num>\d+)\s*[\u2014\u2013-]\s*"
+    r"(?P<part>ROOT CAUSE|RULE):\*{0,2}\s*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+_LESSON_SEP_RE = re.compile(r"^\s*-{3,}$")
 
 
 def _canonical_bytes(block: str) -> bytes:
@@ -828,6 +836,8 @@ def _parse_source_log(source: str, text: str) -> list[dict]:
     sniffing: everything the sibling considers an entry is an entry.
     """
     entry_re = _ERROR_ENTRY_RE if source == "error-log" else _DECISION_ENTRY_RE
+    if source == "lesson-log":
+        return _parse_lesson_drafts(text.splitlines())
     lines = text.splitlines()
     entries: list[dict] = []
     i, n = 0, len(lines)
@@ -859,6 +869,61 @@ def _parse_source_log(source: str, text: str) -> list[dict]:
     return entries
 
 
+def _parse_lesson_drafts(lines: list[str]) -> list[dict]:
+    """Parse rules.txt AI-derived lesson drafts into entry dicts.
+
+    A draft cluster is 'CLUSTER n - ROOT CAUSE: ...' plus 'CLUSTER n -'
+    'RULE: ...' (bold or plain, order agnostic, one optional '---'
+    separator between clusters). Clusters without a RULE are skipped
+    (a lesson with no actionable rule is not importable). Deterministic.
+    """
+    entries: list[dict] = []
+    cur: dict | None = None
+    pending_rules: dict[str, dict] = {}  # num -> {value, lines}
+    for line in lines:
+        m = _LESSON_CLUSTER_RE.match(line)
+        if m:
+            num, part = m.group("num"), m.group("part")
+            value = m.group("value").lstrip(" *").strip()
+            if part == "ROOT CAUSE":
+                if cur is not None and cur.get("rule"):
+                    entries.append(cur)
+                pr = pending_rules.pop(num, None)
+                cur = {"tag": f"CLUSTER {num}", "cause": value,
+                       "rule": pr["value"] if pr else "",
+                       "block": list(pr["lines"]) if pr else []}
+            elif part == "RULE":
+                if cur is not None and cur.get("tag") == f"CLUSTER {num}" \
+                        and not cur.get("rule"):
+                    cur["rule"] = value
+                    cur["block"].append(line)
+                else:
+                    # RULE seen before its cluster header (order-agnostic,
+                    # spec 14.5): buffer it until the ROOT CAUSE arrives.
+                    pending_rules.setdefault(num, {"value": "", "lines": []})
+                    pending_rules[num]["value"] = value
+                    pending_rules[num]["lines"].append(line)
+                continue
+            cur["block"].append(line)
+            continue
+        if _LESSON_SEP_RE.match(line):
+            continue  # separator between clusters; not part of any block
+        if cur is not None:
+            cur["block"].append(line)
+    if cur is not None and cur.get("rule"):
+        entries.append(cur)
+    out: list[dict] = []
+    for e in entries:
+        block = "\n".join(b for b in e["block"] if b.strip())
+        out.append({
+            "tag": e["tag"],
+            "block": block,
+            "fields": {"ROOT CAUSE": e["cause"], "RULE": e["rule"]},
+            "title": e["rule"][:120] or e["cause"][:120],
+        })
+    return out
+
+
 def _entry_to_memory(source: str, entry: dict) -> dict:
     """Map a parsed source entry to create_memory kwargs (boring mapping)."""
     fields = entry["fields"]
@@ -866,6 +931,12 @@ def _entry_to_memory(source: str, entry: dict) -> dict:
         parts = [f"{k}: {fields[k]}" for k in ("ERROR", "CAUSE", "FIX") if fields.get(k)]
         mem_type = "error"
         tags = [fields.get("STATUS", "open").split(".")[0].strip().lower()]
+        paths: list[str] = []
+    elif source == "lesson-log":
+        parts = [f"ROOT CAUSE: {fields.get('ROOT CAUSE', '')}",
+                 f"RULE: {fields.get('RULE', '')}"]
+        mem_type = "lesson"
+        tags = ["ai-draft", "unconfirmed"]
         paths: list[str] = []
     else:
         parts = [f"REASON: {fields['REASON']}" if fields.get("REASON") else "",
@@ -1076,7 +1147,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--trust", choices=("verified", "approved"), required=True)
     p_promote.add_argument("--json", action="store_true")
 
-    p_import = sub.add_parser("import", help="import a family log (error-log / decision-log)")
+    p_import = sub.add_parser("import", help="import a family log (error-log / decision-log / lesson-log)")
     p_import.add_argument("path", help="sibling log file (errors.txt / decisions.txt) or its directory")
     p_import.add_argument("--source", choices=IMPORT_SOURCES, required=True,
                           help="which family log format to parse")

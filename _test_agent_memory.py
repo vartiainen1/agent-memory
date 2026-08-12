@@ -1056,5 +1056,166 @@ def main() -> int:
     return PASS
 
 
+
+# === Tier 2.2 lesson-log import (EVIDENCE-017) ===
+# The AI-derived lesson drafts that check_logs_ai.py --lessons --apply writes
+# into rules.txt section 7 (real format: bold or plain CLUSTER blocks, '---'
+# separators, RULE-less clusters possible when the LLM drops one).
+
+LESSON_FIXTURE = '## 7) LESSONS LEARNED (proposed drafts)\n\nDistilled by check_logs_ai.py - human-confirm before promoting.\n\n**CLUSTER 1 - ROOT CAUSE:** Inconsistent handling of Unicode input/output\nstreams on Windows.\n\n**CLUSTER 1 - RULE:** *Always ensure that any change affecting stdin/stdout\nencoding is paired with docs.*\n\n---\n\n**CLUSTER 2 - ROOT CAUSE:** Lack of automated enforcement for README style.\n\n**CLUSTER 2 - RULE:** *Any commit message or README formatting rule must be\nenforced by an automated check.*\n\n---\n\n**CLUSTER 3 - ROOT CAUSE:** Memory-heavy operations not optimized.\nNo rule was produced for this cluster (LLM dropped it).\n'
+LEAKY_LESSON = '## 7) LESSONS LEARNED (proposed drafts)\n\nDistilled by check_logs_ai.py - human-confirm before promoting.\n\n**CLUSTER 1 - ROOT CAUSE:** Inconsistent handling of Unicode input/output\nstreams on Windows.\n\n**CLUSTER 1 - RULE:** *Always ensure that any change affecting stdin/stdout, api key ghp_12345678901234567890ab\nencoding is paired with docs.*\n\n---\n\n**CLUSTER 2 - ROOT CAUSE:** Lack of automated enforcement for README style.\n\n**CLUSTER 2 - RULE:** *Any commit message or README formatting rule must be\nenforced by an automated check.*\n\n---\n\n**CLUSTER 3 - ROOT CAUSE:** Memory-heavy operations not optimized.\nNo rule was produced for this cluster (LLM dropped it).\n'
+
+
+def test_tier22_lesson_parser_rule_first_order() -> None:
+    """Tier 2.2 REVIEW-REG: the spec claims order-agnostic - a RULE seen
+    before its ROOT CAUSE must be buffered and attached, not crash (the
+    reviewer's critical finding)."""
+    rule_first = ("**CLUSTER 1 - RULE:** *Always ensure stdin/stdout changes "
+                  "are documented.*\n\n"
+                  "**CLUSTER 1 - ROOT CAUSE:** Inconsistent handling of "
+                  "unicode streams.\n\n"
+                  "---\n\n"
+                  "**CLUSTER 2 - ROOT CAUSE:** No automated README "
+                  "enforcement.\n\n"
+                  "**CLUSTER 2 - RULE:** *Automated checks must enforce "
+                  "formatting rules.*\n")
+    entries = am._parse_lesson_drafts(rule_first.splitlines())
+    check("tier2.2: RULE-first order does not crash and parses both",
+          len(entries) == 2, f"(got {len(entries)})")
+    check("tier2.2: buffered RULE attached to its cluster",
+          "stdin/stdout" in entries[0]["fields"]["RULE"],
+          f"(got {entries[0]['fields']['RULE'][:50]!r})")
+    check("tier2.2: CAUSE-first cluster unaffected",
+          "automated checks" in entries[1]["fields"]["RULE"].lower(),
+          f"(got {entries[1]['fields']['RULE'][:50]!r})")
+
+
+def test_tier22_lesson_parser_real_format() -> None:
+    """Tier 2.2: the draft parser handles the real rules.txt section 7
+    format - bold CLUSTER headers, closing ** after the colon, '---'
+    separators - and skips clusters without a RULE."""
+    entries = am._parse_lesson_drafts(LESSON_FIXTURE.splitlines())
+    check("tier2.2: 2 complete clusters parsed (RULE-less cluster 3 skipped)",
+          len(entries) == 2, f"(got {len(entries)})")
+    check("tier2.2: tags are CLUSTER 1/2 in order",
+          [e["tag"] for e in entries] == ["CLUSTER 1", "CLUSTER 2"])
+    check("tier2.2: values stripped of bold/markdown",
+          entries[0]["fields"]["ROOT CAUSE"].startswith("Inconsistent")
+          and not entries[0]["fields"]["RULE"].startswith("*"),
+          f"(got {entries[0]['fields']['RULE'][:40]!r})")
+    check("tier2.2: title is the RULE (actionable knowledge)",
+          "stdin/stdout" in entries[0]["title"])
+    check("tier2.2: deterministic - second parse identical",
+          am._parse_lesson_drafts(LESSON_FIXTURE.splitlines()) == entries)
+
+
+def test_tier22_import_born_untrusted_import_provenance() -> None:
+    """Tier 2.2 INVARIANT: AI-derived lessons are born untrusted with
+    provenance=import and source.repository=agent-log-ai; type=lesson with
+    ai-draft/unconfirmed tags. Import cannot manufacture trust."""
+    store = tmp_store()
+    am.import_source_log(store, "lesson-log", LESSON_FIXTURE, project="p")
+    recs = am.list_memories(store)
+    check("tier2.2: both lessons imported", len(recs) == 2, f"(got {len(recs)})")
+    for r in recs:
+        check(f"tier2.2: {r['title'][:30]}... born untrusted",
+              r["trust"] == "untrusted", f"(got {r['trust']})")
+        check(f"tier2.2: {r['title'][:30]}... provenance import",
+              r["provenance"] == "import", f"(got {r['provenance']})")
+        check(f"tier2.2: {r['title'][:30]}... type lesson",
+              r["type"] == "lesson", f"(got {r['type']})")
+        check(f"tier2.2: {r['title'][:30]}... tags ai-draft",
+              "ai-draft" in r.get("tags", []) and "unconfirmed" in r.get("tags", []),
+              f"(got {r.get('tags')})")
+        src = r.get("source")
+        check(f"tier2.2: {r['title'][:30]}... source agent-log-ai",
+              isinstance(src, dict) and src.get("repository") == "agent-log-ai"
+              and src.get("fingerprint", "").startswith("sha256:"),
+              f"(got {src})")
+
+
+def test_tier22_reimport_no_duplicates() -> None:
+    """Tier 2.2 INVARIANT: re-import of the same rules.txt -> no duplicates."""
+    store = tmp_store()
+    r1 = am.import_source_log(store, "lesson-log", LESSON_FIXTURE, project="p")
+    r2 = am.import_source_log(store, "lesson-log", LESSON_FIXTURE, project="p")
+    check("tier2.2: first import created 2", r1["new"] == 2, f"(got {r1['new']})")
+    check("tier2.2: re-import all duplicates",
+          r2["new"] == 0 and r2["duplicates"] == 2,
+          f"(new {r2['new']}, dup {r2['duplicates']})")
+    check("tier2.2: total unchanged", len(am.list_memories(store)) == 2)
+
+
+def test_tier22_recall_excludes_untrusted_ai_lessons() -> None:
+    """Tier 2.2 DANGEROUS CASE 1: untrusted AI-derived lessons are excluded
+    from recall even on a direct match; search still shows them (operator
+    visibility preserved)."""
+    store = tmp_store()
+    am.import_source_log(store, "lesson-log", LESSON_FIXTURE, project="p")
+    rec = am.recall_memories(store, "stdin encoding windows")
+    check("tier2.2: recall returns 0 on untrusted AI lessons",
+          rec == [], f"(got {len(rec)})")
+    hits = am.search_memories(store, "stdin encoding")
+    check("tier2.2: search still surfaces them for the operator",
+          len(hits) >= 1, f"(got {len(hits)})")
+
+
+def test_tier22_promotion_grants_recall_access() -> None:
+    """Tier 2.2 DANGEROUS CASE 2: after human approval the same lesson IS
+    recalled; an unpromoted sibling lesson stays excluded."""
+    store = tmp_store()
+    am.import_source_log(store, "lesson-log", LESSON_FIXTURE, project="p")
+    recs = am.list_memories(store)
+    stdin_lesson = next(r for r in recs if "stdin" in r["title"])
+    am.promote_trust(store, stdin_lesson["id"], "approved")
+    hits = am.recall_memories(store, "stdin encoding windows")
+    check("tier2.2: approved lesson now recalled",
+          len(hits) == 1 and "stdin" in hits[0]["title"],
+          f"(got {[h['title'][:40] for h in hits]})")
+    hits2 = am.recall_memories(store, "commit message formatting")
+    check("tier2.2: unpromoted lesson still excluded",
+          all("commit message" not in h["title"] for h in hits2),
+          f"(got {[h['title'][:40] for h in hits2]})")
+
+
+def test_tier22_dangerous_wrong_lesson_never_reaches_agent() -> None:
+    """Tier 2.2 DANGEROUS CASE 3: a WRONG AI-derived lesson can never reach
+    agent context unless a human promotes it. The recall contract is 'relevant
+    context or nothing' - silence is the safe outcome."""
+    store = tmp_store()
+    # The LLM's rule is a wrong/incomplete generalization (over-generalizing
+    # from one case to ALL changes) - still untrusted, still excluded.
+    wrong = LESSON_FIXTURE.replace(
+        "Inconsistent handling of Unicode input/output",
+        "A single user asked about unicode once - irrelevant",
+    )
+    am.import_source_log(store, "lesson-log", wrong, project="p")
+    hits = am.recall_memories(store, "unicode encoding")
+    check("tier2.2: wrong untrusted lesson excluded from agent context",
+          hits == [], f"(got {len(hits)})")
+    shits = am.search_memories(store, "unicode encoding")
+    check("tier2.2: search shows it flagged untrusted only",
+          all(h["trust"] == "untrusted" for h in shits),
+          f"(got {[h['trust'] for h in shits]})")
+
+
+def test_tier22_secret_in_lesson_rejected_before_persist() -> None:
+    """Tier 2.2 INVARIANT: secret detection runs before persistence for
+    lesson imports too - an AI draft containing a leaked key is rejected,
+    counted, and never stored."""
+    store = tmp_store()
+    report = am.import_source_log(store, "lesson-log", LEAKY_LESSON, project="p")
+    check("tier2.2: leaky draft rejected, not persisted",
+          report["rejected"] == 1 and report["new"] == 1,
+          f"(rejected {report['rejected']}, new {report['new']})")
+    check("tier2.2: rejection detail names the entry",
+          len(report["rejected_details"]) == 1
+          and "secret" in report["rejected_details"][0]["reason"].lower(),
+          f"(got {report['rejected_details']})")
+    recs = am.list_memories(store)
+    check("tier2.2: only the clean lesson persisted",
+          len(recs) == 1 and all("ghp_" not in str(r.get("content", "")) for r in recs))
+
+
 if __name__ == "__main__":
     sys.exit(main())

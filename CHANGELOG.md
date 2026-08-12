@@ -5,11 +5,12 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
-### Added (v0.2 Tier 2.3, family import - EVIDENCE-003/016)
+### Added (v0.2 Tier 2.3 + 2.2, family import - EVIDENCE-003/016/017)
 
-- `import` command: canonical-fingerprint import of agent-error-log
-  and agent-decision-log logs (untrusted, provenance-tracked,
-  idempotent, secret-detected, SUPERSEDES-wired, dry-run).
+- `import` command: canonical-fingerprint import of agent-error-log,
+  agent-decision-log and agent-log-ai (rules.txt lesson drafts) logs
+  (untrusted, provenance-tracked, idempotent, secret-detected,
+  SUPERSEDES-wired, dry-run).
 
 ### Added (v0.2 Tier 2.1, retrieval - EVIDENCE-010/015)
 
