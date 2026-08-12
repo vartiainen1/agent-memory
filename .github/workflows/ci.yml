@@ -1,0 +1,80 @@
+name: CI
+
+# Runs on every push and pull request. Backstop for local discipline: if
+# tests, the external-API audit, or the drift guards fail, the check fails
+# here - a broken README/SPEC claim or regression can no longer hide.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    name: tests + audit + lint (py ${{ matrix.python-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile check
+        run: python -m py_compile agent_memory.py _check_drift.py
+
+      - name: Unit + integration tests
+        run: python _test_agent_memory.py
+
+      - name: External-API audit (real binary via subprocess)
+        run: python _audit_cli.py
+
+      - name: Determinism spot-check (byte-identical runs)
+        run: python -c "import subprocess,sys; a=subprocess.run([sys.executable,'_audit_cli.py'],capture_output=True,text=True); b=subprocess.run([sys.executable,'_audit_cli.py'],capture_output=True,text=True); assert a.stdout==b.stdout, 'non-deterministic audit output'"
+
+  drift-guard:
+    name: drift guards (README / SPEC / pyproject vs code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Drift guard
+        run: python3 _check_drift.py
+
+  packaging:
+    name: packaging (build + install + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Install wheel in a fresh venv
+        run: |
+          python -m venv /tmp/pkgenv
+          /tmp/pkgenv/bin/pip install --quiet dist/*.whl
+
+      - name: Console script + import smoke test
+        run: |
+          /tmp/pkgenv/bin/agent-memory --version >/dev/null
+          /tmp/pkgenv/bin/agent-memory --help >/dev/null
+          /tmp/pkgenv/bin/python -c "import agent_memory; print('module import OK')"
