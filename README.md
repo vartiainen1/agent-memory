@@ -2,6 +2,14 @@
 
 Local-first knowledge and governance layer for AI coding agents.
 
+[![CI](https://github.com/vartiainen1/agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/vartiainen1/agent-memory/actions/workflows/ci.yml)
+[![checks on master](https://img.shields.io/github/checks-status/vartiainen1/agent-memory/master)](https://github.com/vartiainen1/agent-memory/actions)
+[![release](https://img.shields.io/github/v/release/vartiainen1/agent-memory)](https://github.com/vartiainen1/agent-memory/releases)
+[![license](https://img.shields.io/github/license/vartiainen1/agent-memory)](https://github.com/vartiainen1/agent-memory/blob/master/LICENSE)
+[![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-3776AB)](https://github.com/vartiainen1/agent-memory/actions)
+[![dependencies-0](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/vartiainen1/agent-memory)
+[![Visitors](https://visitor-badge.laobi.icu/badge?page_id=vartiainen1.agent-memory&left_text=Visitors&right_color=2F80ED)](https://github.com/vartiainen1/agent-memory)
+
 agent-memory gives agents persistent project memory while keeping trust,
 history, and authority under system and human control. **The AI can use
 memory, but the AI must not have unrestricted authority over memory.**
