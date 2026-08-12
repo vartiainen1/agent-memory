@@ -36,7 +36,138 @@ def tmp_store(**init_kwargs) -> Path:
     return store
 
 
-# --------------------------------------------------------------------------
+def test_tier21_floor_drops_weak_tail() -> None:
+    """v0.2 Tier 2.1 (EVIDENCE-010/015): recall on a small store returns the
+    genuinely relevant cluster, not the whole corpus. A memory matching the
+    query once in content (idf-weight ~1, far below 0.25 x the top text
+    score) is dropped by the floor."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "config format: back to YAML",
+                     "REASON: YAML is the canonical config format",
+                     tags=["config", "yaml"], project="p")
+    am.create_memory(store, "decision", "config format: TOML",
+                     "REASON: TOML is stricter", tags=["config", "toml"],
+                     project="p")
+    am.create_memory(store, "decision", "filler unrelated",
+                     "just one config mention nowhere else", tags=["misc"],
+                     project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "config format")
+    titles = [r["title"] for r in results]
+    check("tier2.1: weak single-mention memory dropped by the floor",
+          "filler unrelated" not in titles, f"(got {titles})")
+    check("tier2.1: relevant cluster kept",
+          "config format: back to YAML" in titles and
+          "config format: TOML" in titles, f"(got {titles})")
+
+
+def test_tier21_floor_sparse_unique_match_survives() -> None:
+    """v0.2 Tier 2.1: 'genuinely relevant low-score results' requirement - a
+    sparse-but-unique match (low text score, sole match for the query) is
+    never zeroed, because the top text score always passes its own relative
+    floor (an ABSOLUTE threshold would drop it - this test discriminates)."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "deploy kubernetes cluster",
+                     "REASON: production runs on k8s", tags=["kubernetes"],
+                     project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "kubernetes")
+    check("tier2.1: sparse unique match survives the floor",
+          len(results) == 1 and results[0]["title"] == "deploy kubernetes cluster",
+          f"(got {len(results)})")
+
+
+def test_tier21_floor_honest_zero_preserved() -> None:
+    """v0.2 Tier 2.1: unknown queries still return 0 results (the invariant
+    must survive the floor - EVIDENCE-003)."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "auth session state",
+                     "server-side session", tags=["auth"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "deploy kubernetes cluster")
+    check("tier2.1: honest zero results preserved",
+          results == [], f"(got {len(results)})")
+
+
+def test_tier21_floor_tiny_store() -> None:
+    """v0.2 Tier 2.1: stores smaller than any floor assumption (2 memories)
+    behave sanely - both equally-matching memories are returned (ties are
+    not floored)."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "alpha auth", "about auth alpha",
+                     tags=["auth"], project="p")
+    am.create_memory(store, "decision", "beta auth", "about auth beta",
+                     tags=["auth"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "auth")
+    check("tier2.1: tiny store returns both matching memories",
+          len(results) == 2, f"(got {len(results)})")
+
+
+def test_tier21_floor_ignores_superseded() -> None:
+    """v0.2 Tier 2.1: the floor never resurrects superseded memories - the
+    candidate set is active-only (floor applies after status filtering)."""
+    store = tmp_store()
+    a = am.create_memory(store, "decision", "config: yaml", "yaml wins",
+                         tags=["config"], project="p")
+    b = am.create_memory(store, "decision", "config: toml", "toml supersedes",
+                         tags=["config"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    am.supersede(store, a["id"], b["id"])
+    results = am.recall_memories(store, "config")
+    check("tier2.1: superseded excluded (floor does not resurrect)",
+          [r["title"] for r in results] == ["config: toml"],
+          f"(got {[r['title'] for r in results]})")
+
+
+def test_tier21_floor_path_match_exempt() -> None:
+    """v0.2 Tier 2.1: a memory that matches --path survives the floor even
+    when its text score is far below the ratio - path is explicit intent
+    (always kept), though it may still rank below a stronger text match."""
+    store = tmp_store()
+    am.create_memory(store, "constraint", "auth must use service",
+                     "always route through AuthService",
+                     tags=["auth"], paths=["src/auth/*"], project="p")
+    am.create_memory(store, "lesson", "auth middleware note",
+                     "middleware wraps the handler", tags=["auth"],
+                     paths=["src/auth/middleware.py"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "auth must use service",
+                                 path="src/auth/middleware.py")
+    titles = [r["title"] for r in results]
+    check("tier2.1: path-matched memory exempt from the floor",
+          "auth middleware note" in titles, f"(got {titles})")
+
+
+def test_tier21_floor_search_stays_inclusive() -> None:
+    """v0.2 Tier 2.1: search is NOT floored - operators keep full visibility
+    of weak matches (EVIDENCE-007); only recall (agent-facing) applies the
+    floor."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "config format: back to YAML",
+                     "REASON: YAML is the canonical config format",
+                     tags=["config"], project="p")
+    am.create_memory(store, "decision", "filler unrelated",
+                     "just one config mention nowhere else", tags=["misc"],
+                     project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    s = am.search_memories(store, "config format")
+    r = am.recall_memories(store, "config format")
+    s_titles = [m["title"] for m in s]
+    r_titles = [m["title"] for m in r]
+    check("tier2.1: search returns weak matches (inclusive)",
+          "filler unrelated" in s_titles, f"(got {s_titles})")
+    check("tier2.1: recall drops the weak match (floored)",
+          "filler unrelated" not in r_titles, f"(got {r_titles})")
+
+
 # 1. Schema / validation
 # --------------------------------------------------------------------------
 

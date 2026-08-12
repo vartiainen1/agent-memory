@@ -129,6 +129,12 @@ is a human-only command; there is no agent-accessible path to raise trust or
 alter history. Everything the agent reads or the system mutates is recorded in
 `audit.jsonl`.
 
+`recall` also applies a **relevance floor** (`SCORE_FLOOR_RATIO = 0.25`):
+results whose text score is below 25% of the best match are dropped,
+unless they match `--path` (explicit intent). `search` stays
+inclusive — operators see everything that matches; agents get only
+confident context.
+
 ## Storage layout
 
 ```
@@ -199,7 +205,7 @@ manual via `add --provenance import`.)
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (142 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (151 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
 ```
 

@@ -586,6 +586,7 @@ def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str 
 
 
 PHRASE_BONUS = 2.0  # per contiguous adjacent query pair found in a field
+SCORE_FLOOR_RATIO = 0.25  # recall-only: drop text scores below ratio x top text score
 
 
 def _term_doc_freqs(records: list[dict], terms: list[str]) -> dict[str, int]:
@@ -626,28 +627,49 @@ def _field_score(text: str, terms: list[str], idf: dict[str, float]) -> float:
 
 
 def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
-                  path: str | None = None) -> list[dict]:
+                  path: str | None = None,
+                  floor_ratio: float | None = None) -> list[dict]:
     """Deterministic relevance ranking shared by search and recall (Tier 1).
 
     Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
     a phrase bonus; +PATH_BONUS when --path matches. Scores round to 6
     decimals for cross-platform-stable ordering; exact ties break on
-    (created_at, id) desc. Honest zero results: score <= 0 (no term hits, no
-    path match) is excluded - recall never invents context (EVIDENCE-003).
+    (created_at, title, id) desc. Honest zero results: score <= 0 (no term
+    hits, no path match) is excluded - recall never invents context
+    (EVIDENCE-003).
+
+    floor_ratio (Tier 2.1, EVIDENCE-010/015): when set, a memory's TEXT score
+    must be >= floor_ratio x the best text score in the candidate set, UNLESS
+    it matches --path (path = explicit operator/agent intent, always kept).
+    Relative, not absolute: self-calibrates with corpus size (idf scales with
+    ln N) and can never zero out a sparse-but-unique match (the top text
+    score always passes). Applied by recall only; search stays inclusive so
+    operators keep full visibility (EVIDENCE-007).
     """
-    scored = []
+    entries = []
     for r in records:
         tags_text = " ".join(r.get("tags", []))
-        score = (3.0 * _field_score(r.get("title", ""), terms, idf)
-                 + 2.0 * _field_score(tags_text, terms, idf)
-                 + 1.0 * _field_score(r.get("content", ""), terms, idf))
+        text = round(
+            3.0 * _field_score(r.get("title", ""), terms, idf)
+            + 2.0 * _field_score(tags_text, terms, idf)
+            + 1.0 * _field_score(r.get("content", ""), terms, idf), 6)
+        matched_path = False
         if path:
             for pat in r.get("paths", []):
                 if path_matches(pat, path):
-                    score += PATH_BONUS
+                    matched_path = True
                     break
-        if score > 0:
-            scored.append((round(score, 6), r))
+        entries.append((text, matched_path, r))
+    best = max((e[0] for e in entries), default=0.0)
+    scored = []
+    for text, matched_path, r in entries:
+        if text <= 0 and not matched_path:
+            continue  # honest zero: no term hits and no path match.
+        if (floor_ratio is not None and not matched_path and text > 0
+                and text < floor_ratio * best):
+            continue  # weak tail below the relevance floor.
+        score = text + (PATH_BONUS if matched_path else 0.0)
+        scored.append((round(score, 6), r))
     scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""),
                                   pair[1].get("title", ""),
                                   pair[1].get("id", "")), reverse=True)
@@ -681,6 +703,8 @@ def search_memories(
     else:
         records = [r for r in records if r.get("status") in ("active", "superseded")]
     idf = _idf_weights(len(records), _term_doc_freqs(records, terms))
+    # Search is operator-facing: inclusive on purpose (EVIDENCE-007 - the
+    # operator sees superseded/weak matches; the agent does not). No floor.
     return _rank_records(records, terms, idf)[:limit]
 
 
@@ -702,7 +726,10 @@ def recall_memories(
     if not include_untrusted:
         records = [r for r in records if r.get("trust") != "untrusted"]
     idf = _idf_weights(len(records), _term_doc_freqs(records, terms))
-    return _rank_records(records, terms, idf, path=path)[:limit]
+    # Tier 2.1 floor (EVIDENCE-010/015): recall is agent-facing, precision
+    # matters - drop the weak tail, keep path matches, keep honest zeros.
+    return _rank_records(records, terms, idf, path=path,
+                          floor_ratio=SCORE_FLOOR_RATIO)[:limit]
 
 
 def status_summary(store: pathlib.Path) -> dict:

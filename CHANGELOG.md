@@ -5,6 +5,12 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.2 Tier 2.1, retrieval - EVIDENCE-010/015)
+
+- Recall-only relevance floor (SCORE_FLOOR_RATIO = 0.25): weak
+  tails dropped, path matches exempt, honest zero results
+  preserved; search stays inclusive.
+
 
 ### Added (v0.2 Tier 1, retrieval - EVIDENCE-012/013)
 
