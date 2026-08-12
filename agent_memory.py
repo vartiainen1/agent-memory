@@ -26,6 +26,7 @@ Exit codes: 0 = success, 1 = runtime error, 2 = usage error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import pathlib
@@ -61,6 +62,11 @@ SEVERITIES = ("low", "normal", "high", "critical")
 DEFAULT_RECALL_LIMIT = 10
 DEFAULT_SEARCH_LIMIT = 50
 PATH_BONUS = 10
+
+# Family import (V0.1_SPEC.md section 14, v0.2 Tier 2.3 - EVIDENCE-003/016).
+IMPORT_SOURCES = ("error-log", "decision-log")
+IMPORT_REPOS = {"error-log": "agent-error-log", "decision-log": "agent-decision-log"}
+IMPORT_LOG_FILES = {"error-log": "errors.txt", "decision-log": "decisions.txt"}
 
 # Secret detection (V0.1_SPEC.md section 5) - best-effort, documented imperfect.
 SECRET_PATTERNS = [
@@ -215,6 +221,19 @@ def detect_secret(title: str, content: str) -> str | None:
 # --------------------------------------------------------------------------
 # Schema validation (V0.1_SPEC.md sections 3 + 6)
 # --------------------------------------------------------------------------
+
+def _validate_source(source: dict) -> None:
+    """Source-provenance dict (spec 3.9): type/repository/fingerprint strings."""
+    if not isinstance(source, dict):
+        raise UsageError("source must be a dict or null")
+    for key in ("type", "repository", "fingerprint"):
+        if not isinstance(source.get(key), str) or not source[key]:
+            raise UsageError(f"source.{key} must be a non-empty string")
+    if not source["fingerprint"].startswith("sha256:"):
+        raise UsageError("source.fingerprint must start with 'sha256:'")
+    if "tag" in source and (not isinstance(source["tag"], str) or not source["tag"]):
+        raise UsageError("source.tag must be a non-empty string when present")
+
 
 def validate_memory(record: dict) -> None:
     """Validate a memory record. Raises UsageError with a clean message on failure."""
@@ -432,6 +451,7 @@ def create_memory(
     severity: str = "normal",
     tags: list[str] | None = None,
     paths: list[str] | None = None,
+    source: dict | None = None,
     allow_secret: bool = False,
     actor: str = "human",
 ) -> dict:
@@ -446,6 +466,8 @@ def create_memory(
         raise UsageError("provenance 'system' is application-internal and cannot be set via the CLI")
     if severity not in SEVERITIES:
         raise UsageError(f"invalid severity {severity!r}: must be one of {', '.join(SEVERITIES)}")
+    if source is not None:
+        _validate_source(source)
     if not isinstance(title, str) or not title.strip():
         raise UsageError("title must be a non-empty string")
     if not isinstance(content, str) or not content.strip():
@@ -472,7 +494,7 @@ def create_memory(
         "paths": paths or [],
         "created_at": timestamp,
         "updated_at": timestamp,
-        "source": None,
+        "source": source,
         "supersedes": None,
         "superseded_by": None,
         "deleted_at": None,
@@ -766,6 +788,229 @@ def memory_summary(record: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# Family import (V0.1_SPEC.md section 14 - v0.2 Tier 2.3, EVIDENCE-003/016)
+# --------------------------------------------------------------------------
+
+_ERROR_ENTRY_RE = re.compile(r"^\[(?P<tag>[^\]]+)\] AREA: (?P<area>.+)$")
+_DECISION_ENTRY_RE = re.compile(r"^\[(?P<tag>[^\]]+)\] DECISION: (?P<title>.+)$")
+_IMPORT_FIELD_RE = re.compile(r"^  (?P<field>[A-Z]+):\s*(?P<value>.*)$")
+_SECTION_SEP_RE = re.compile(r"^={4,}$")
+
+
+def _canonical_bytes(block: str) -> bytes:
+    """Canonical bytes of a source entry for fingerprinting (spec 14.2).
+
+    UTF-8, LF line endings (CRLF normalized), trailing whitespace stripped
+    per line, exactly one trailing newline. Same source entry -> same
+    fingerprint, independent of the host OS or editor (ROUND 2 #2).
+    """
+    lines = [ln.rstrip() for ln in block.replace("\r\n", "\n").split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def fingerprint_entry(block: str) -> str:
+    """sha256:<64 hex> over the canonical bytes of a source entry block."""
+    return "sha256:" + hashlib.sha256(_canonical_bytes(block)).hexdigest()
+
+
+def _parse_source_log(source: str, text: str) -> list[dict]:
+    """Parse a sibling log into entry dicts, in file order.
+
+    Mirrors the siblings' OWN canonical parsers: an entry is a column-0
+    '[tag] AREA:' / '[tag] DECISION:' header plus its indented fields,
+    running until the next entry header or a '====' section separator. The
+    template section is indented so it never matches (same contract as
+    check_errors.parse_entries / check_decisions.parse_entries). No section
+    sniffing: everything the sibling considers an entry is an entry.
+    """
+    entry_re = _ERROR_ENTRY_RE if source == "error-log" else _DECISION_ENTRY_RE
+    lines = text.splitlines()
+    entries: list[dict] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        m = entry_re.match(line)
+        if not m:
+            i += 1
+            continue
+        j = i + 1
+        body: list[str] = []
+        while j < n and not (entry_re.match(lines[j]) or _SECTION_SEP_RE.match(lines[j])):
+            body.append(lines[j])
+            j += 1
+        fields: dict[str, str] = {}
+        for bl in body:
+            fm = _IMPORT_FIELD_RE.match(bl)
+            if fm:
+                fields.setdefault(fm.group("field"), fm.group("value").strip())
+        block = "\n".join([line] + body)
+        entry = {
+            "tag": m.group("tag"),
+            "block": block,
+            "fields": fields,
+        }
+        entry["title"] = m.group("area") if source == "error-log" else m.group("title")
+        entries.append(entry)
+        i = j
+    return entries
+
+
+def _entry_to_memory(source: str, entry: dict) -> dict:
+    """Map a parsed source entry to create_memory kwargs (boring mapping)."""
+    fields = entry["fields"]
+    if source == "error-log":
+        parts = [f"{k}: {fields[k]}" for k in ("ERROR", "CAUSE", "FIX") if fields.get(k)]
+        mem_type = "error"
+        tags = [fields.get("STATUS", "open").split(".")[0].strip().lower()]
+        paths: list[str] = []
+    else:
+        parts = [f"REASON: {fields['REASON']}" if fields.get("REASON") else "",
+                 f"FILES: {fields['FILES']}" if fields.get("FILES") else ""]
+        mem_type = "decision"
+        tags = [fields.get("STATUS", "open").split(".")[0].strip().lower()]
+        paths = [p.strip() for p in fields.get("FILES", "").split(",") if p.strip()]
+    content = "\n".join(p for p in parts if p)
+    if not content:
+        content = "(no fields)"  # title-only entry; still importable
+    return {"type": mem_type, "title": entry["title"].strip(),
+            "content": content, "tags": tags, "paths": paths}
+
+
+def import_source_log(
+    store: pathlib.Path,
+    source: str,
+    text: str,
+    project: str,
+    actor: str = "human",
+    dry_run: bool = False,
+) -> dict:
+    """Import a sibling log into the store. Returns a report dict.
+
+    Invariants (spec 14.3, EVIDENCE-016):
+      - Same source entry -> same fingerprint; re-import -> no duplicates.
+      - Imported memories are born untrusted, provenance='import'; import
+        never promotes (cannot manufacture verified/approved/system).
+      - Secret detection runs BEFORE persistence (create_memory rejects;
+        rejections are counted + audited, not silently dropped).
+      - Source provenance survives; SUPERSEDES links are wired where the
+        target is deterministically knowable (same run, target active).
+      - Existing memories are never overwritten.
+    """
+    if source not in IMPORT_SOURCES:
+        raise UsageError(f"--source must be one of {', '.join(IMPORT_SOURCES)} (got {source!r})")
+    entries = _parse_source_log(source, text)
+    report = {
+        "source": source,
+        "repository": IMPORT_REPOS[source],
+        "entries": len(entries),
+        "new": 0,
+        "duplicates": 0,
+        "rejected": 0,
+        "rejected_details": [],
+        "superseded": 0,
+        "already_wired": 0,
+        "unresolved_supersedes": 0,
+        "dry_run": dry_run,
+        "results": [],
+    }
+
+    if dry_run:
+        for e in entries:
+            report["results"].append({
+                "title": e["title"],
+                "fingerprint": fingerprint_entry(e["block"]),
+                "action": "create",
+            })
+        report["new"] = len(entries)
+        return report
+
+    # Existing fingerprints -> dedupe (same source entry, same fingerprint).
+    existing: dict[str, str] = {}  # fingerprint -> id (all memories)
+    tag_to_id: dict[str, str] = {}  # source tag -> id (all memories)
+    for r in list_memories(store):
+        src = r.get("source")
+        if isinstance(src, dict):
+            if src.get("fingerprint"):
+                existing.setdefault(src["fingerprint"], r["id"])
+            if src.get("tag"):
+                tag_to_id.setdefault(src["tag"], r["id"])
+
+    for e in entries:
+        fp = fingerprint_entry(e["block"])
+        if fp in existing:
+            report["duplicates"] += 1
+            tag_to_id[e["tag"]] = existing[fp]
+            continue
+        mapping = _entry_to_memory(source, e)
+        try:
+            record = create_memory(
+                store=store,
+                mem_type=mapping["type"],
+                title=mapping["title"],
+                content=mapping["content"],
+                project=project,
+                provenance="import",
+                tags=mapping["tags"],
+                paths=mapping["paths"],
+                source={
+                    "type": mapping["type"],
+                    "repository": IMPORT_REPOS[source],
+                    "fingerprint": fp,
+                    "tag": e["tag"],
+                },
+                actor=actor,
+            )
+        except AgentMemoryError as exc:  # secret detection / validation
+            report["rejected"] += 1
+            report["rejected_details"].append({"title": e["title"], "reason": str(exc)})
+            continue
+        report["new"] += 1
+        tag_to_id[e["tag"]] = record["id"]
+        report["results"].append({"id": record["id"], "title": e["title"],
+                                  "fingerprint": fp})
+
+    # Supersession wiring: entry with SUPERSEDES <tag> -> supersede old->new,
+    # oldest first (file order), only when both are active and knowable.
+    if source == "decision-log":
+        for e in entries:
+            target = e["fields"].get("SUPERSEDES", "").strip()
+            if not target:
+                continue
+            new_id = tag_to_id.get(e["tag"])
+            old_id = tag_to_id.get(target)
+            if not new_id or not old_id:
+                report["unresolved_supersedes"] += 1
+                continue
+            old = load_memory(store, old_id)
+            new = load_memory(store, new_id)
+            if old["status"] != "active" or new.get("supersedes"):
+                report["already_wired"] += 1
+                continue
+            try:
+                supersede(store, old_id, new_id, actor=actor)
+                report["superseded"] += 1
+            except AgentMemoryError:
+                report["unresolved_supersedes"] += 1
+
+    append_audit(store, "IMPORT_RUN", None, actor, {
+        "source": source,
+        "repository": IMPORT_REPOS[source],
+        "entries": report["entries"],
+        "new": report["new"],
+        "duplicates": report["duplicates"],
+        "rejected": report["rejected"],
+        "superseded": report["superseded"],
+        "already_wired": report["already_wired"],
+        "unresolved_supersedes": report["unresolved_supersedes"],
+    })
+    return report
+
+
+# --------------------------------------------------------------------------
 # CLI (V0.1_SPEC.md section 6)
 # --------------------------------------------------------------------------
 
@@ -830,6 +1075,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("mem_id")
     p_promote.add_argument("--trust", choices=("verified", "approved"), required=True)
     p_promote.add_argument("--json", action="store_true")
+
+    p_import = sub.add_parser("import", help="import a family log (error-log / decision-log)")
+    p_import.add_argument("path", help="sibling log file (errors.txt / decisions.txt) or its directory")
+    p_import.add_argument("--source", choices=IMPORT_SOURCES, required=True,
+                          help="which family log format to parse")
+    p_import.add_argument("--dry-run", action="store_true",
+                          help="parse + fingerprint only; persist nothing")
+    p_import.add_argument("--json", action="store_true")
 
     p_super = sub.add_parser("supersede", help="mark old memory superseded by new")
     p_super.add_argument("old_id")
@@ -979,6 +1232,34 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"promoted {args.mem_id} to trust={args.trust}")
             return 0
+        if args.command == "import":
+            path = pathlib.Path(args.path)
+            if path.is_dir():
+                path = path / IMPORT_LOG_FILES[args.source]
+            if not path.is_file():
+                raise UsageError(f"cannot read {path}: not a file")
+            text = path.read_text(encoding="utf-8-sig")
+            report = import_source_log(
+                store, args.source, text, config["project"],
+                dry_run=args.dry_run,
+            )
+            if args.json:
+                _emit_json(report)
+            else:
+                verb = "would import" if report["dry_run"] else "imported"
+                print(f"{verb} {report['entries']} entr(y/ies) from "
+                      f"{report['repository']}: {report['new']} new, "
+                      f"{report['duplicates']} duplicate(s) skipped, "
+                      f"{report['rejected']} rejected")
+                if report["superseded"]:
+                    print(f"  {report['superseded']} supersession link(s) wired")
+                if report["unresolved_supersedes"]:
+                    print(f"  {report['unresolved_supersedes']} SUPERSEDES "
+                          f"reference(s) unresolved (target not imported)")
+                for r in report["rejected_details"]:
+                    print(f"  rejected: {r['title']} - {r['reason']}")
+            return 0
+
         if args.command == "supersede":
             old = supersede(store, args.old_id, args.new_id)
             if args.json:

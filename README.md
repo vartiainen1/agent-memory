@@ -91,6 +91,7 @@ agent-memory recall "auth" --path src/auth/login.py
 | `search QUERY [--type T] [--status S] [--limit N] [--json]` | operator textual search (limit 50) |
 | `recall QUERY [--path P] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only) |
 | `promote <mem_id> --trust verified\|approved` | human trust promotion (never `system`) |
+| `import PATH --source error-log\|decision-log` | family import (untrusted, provenance-tracked, idempotent) |
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
 | `status [--json]` | store health + counts |
@@ -134,6 +135,25 @@ results whose text score is below 25% of the best match are dropped,
 unless they match `--path` (explicit intent). `search` stays
 inclusive — operators see everything that matches; agents get only
 confident context.
+
+### Family import (cold-start)
+
+A brand-new project can adopt the family's accumulated knowledge instead of
+starting empty:
+
+```
+agent-memory init
+agent-memory import ../agent-error-log --source error-log
+agent-memory import ../agent-decision-log --source decision-log
+agent-memory list            # imported memories (untrusted)
+agent-memory promote <id> --trust approved   # human-curate what the agent may recall
+```
+
+Imported memories are born untrusted — `recall` ignores them until a human
+promotes them, so import can never inject unverified context into an agent.
+Re-running an import is safe: entries are deduplicated by a canonical
+fingerprint (same source entry → same fingerprint, independent of line
+endings).
 
 ## Storage layout
 
@@ -205,7 +225,7 @@ manual via `add --provenance import`.)
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (151 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (187 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
 ```
 

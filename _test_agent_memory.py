@@ -169,7 +169,253 @@ def test_tier21_floor_search_stays_inclusive() -> None:
 
 
 # 1. Schema / validation
-# --------------------------------------------------------------------------
+ERROR_LOG_FIXTURE = """================================================================================
+ERROR LOG - HOW TO USE
+================================================================================
+Tooling (run from this folder):
+  python check_errors.py   validate every entry
+
+================================================================================
+EXAMPLE ENTRIES (replace with your own; delete this section header)
+================================================================================
+
+[2026-08-05] AREA: payment webhook parser
+  ERROR: KeyError: 'amount' on webhook payloads without an amount field
+  CAUSE: the payload dict has no 'amount' key
+  FIX: use payload.get('amount', 0)
+  STATUS: FIXED.
+
+================================================================================
+REAL ENTRIES
+================================================================================
+
+[2026-08-09] AREA: CI commit-message gate missing
+  ERROR: --no-verify commits slip past the local gate unnoticed
+  CAUSE: the CI backstop never re-checked the commit message
+  FIX: check_errors.py --check-commit + a commit-gate CI job
+  STATUS: FIXED.
+
+[2026-08-12] AREA: diff-gate --staged outside a git repo
+  ERROR: dumps raw git usage and exits 2
+  CAUSE: no git repo guard existed
+  FIX: detect non-repo and exit cleanly
+  STATUS: OPEN.
+"""
+
+DECISION_LOG_FIXTURE = """# DECISION LOG
+# Append-only: corrections are new entries that point back.
+
+================================================================================
+1) EXAMPLE ENTRIES
+================================================================================
+[2026-08-09 14:32] DECISION: used regex instead of AST parser
+  REASON: faster for simple case, file was small
+  FILES: src/parser.py
+  STATUS: LOCKED
+
+================================================================================
+4) COMPANION TOOL
+================================================================================
+[2026-08-09 05:45] DECISION: JWT for single-consumer API
+  REASON: one API consumer, no third-party login needed
+  FILES: auth.py
+  SUPERSEDES: 2026-08-09 14:32
+  STATUS: LOCKED.
+
+[2026-08-11 10:00] DECISION: back to regex for the small parser
+  REASON: parser file shrank to 40 lines
+  FILES: src/parser.py
+  SUPERSEDES: 2026-08-09 14:32
+  STATUS: REVISED.
+
+[2026-08-12 11:30] DECISION: AST after all - parser split across modules
+  REASON: refactor split the parser; regex state scattered
+  FILES: src/parser.py
+  SUPERSEDES: 2026-08-11 10:00
+  STATUS: REVISED.
+"""
+
+
+def test_tier23_import_all_entries_mirrors_sibling_parser() -> None:
+    """v0.2 Tier 2.3: import parses what the sibling's own parse_entries
+    considers an entry - including EXAMPLE-section entries (they are real
+    chain roots: the decision-log's SUPERSEDES references point at them)."""
+    store = tmp_store()
+    report = am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    check("tier2.3: error-log parses all 3 real + example entries",
+          report["new"] == 3, f"(got {report['entries']} entries, {report['new']} new)")
+    store2 = tmp_store()
+    report2 = am.import_source_log(store2, "decision-log", DECISION_LOG_FIXTURE, project="p")
+    check("tier2.3: decision-log parses all 4 entries",
+          report2["new"] == 4, f"(got {report2['new']})")
+
+
+def test_tier23_invariant_same_entry_same_fingerprint() -> None:
+    """INVARIANT 1: same source entry -> same fingerprint, independent of
+    EOL/trailing whitespace (canonicalization contract, ROUND 2 #2)."""
+    a = "[2026-08-09] AREA: CI gate\n  ERROR: x\n  STATUS: FIXED."
+    b = "[2026-08-09] AREA: CI gate\r\n  ERROR: x \r\n  STATUS: FIXED.   \n\n"
+    check("tier2.3: canonical bytes identical across EOL/whitespace",
+          am._canonical_bytes(a) == am._canonical_bytes(b))
+    check("tier2.3: same fingerprint", am.fingerprint_entry(a) == am.fingerprint_entry(b))
+    check("tier2.3: fingerprint prefixed sha256:",
+          am.fingerprint_entry(a).startswith("sha256:"))
+
+
+def test_tier23_invariant_reimport_no_duplicates() -> None:
+    """INVARIANT 2: re-import -> no duplicate memory (fingerprint dedupe)."""
+    store = tmp_store()
+    r1 = am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    r2 = am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    total = len(am.list_memories(store))
+    check("tier2.3: first import created memories",
+          r1["new"] == 3 and total == 3, f"(total {total})")
+    check("tier2.3: re-import creates nothing",
+          r2["new"] == 0 and r2["duplicates"] == 3,
+          f"(new {r2['new']}, dup {r2['duplicates']})")
+    check("tier2.3: re-import total unchanged", total == 3)
+
+
+def test_tier23_invariant_untrusted_and_import_provenance() -> None:
+    """INVARIANT 3+4: imported material starts untrusted with provenance
+    import; import never manufactures verified/approved/system trust."""
+    store = tmp_store()
+    am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    for r in am.list_memories(store):
+        check(f"tier2.3: {r['title']} born untrusted", r["trust"] == "untrusted",
+              f"(got {r['trust']})")
+        check(f"tier2.3: {r['title']} provenance import", r["provenance"] == "import",
+              f"(got {r['provenance']})")
+        src = r.get("source")
+        check(f"tier2.3: {r['title']} source populated",
+              isinstance(src, dict) and src.get("repository") == "agent-error-log"
+              and src.get("fingerprint", "").startswith("sha256:"),
+              f"(got {src})")
+
+
+def test_tier23_invariant_secret_before_persist() -> None:
+    """INVARIANT 5: secret detection runs BEFORE persistence; a source entry
+    carrying a secret is rejected + audited, never stored."""
+    secret_log = ERROR_LOG_FIXTURE.replace("use payload.get('amount', 0)",
+                                           "use token ghp_1234567890abcdefghij")
+    store = tmp_store()
+    report = am.import_source_log(store, "error-log", secret_log, project="p")
+    check("tier2.3: secret entry rejected", report["rejected"] == 1,
+          f"(got {report['rejected']}, {report['rejected_details']})")
+    check("tier2.3: secret entry not persisted", len(am.list_memories(store)) == 2,
+          f"(got {len(am.list_memories(store))})")
+    check("tier2.3: MEMORY_REJECTED audited",
+          "MEMORY_REJECTED" in am.read_audit(store).__class__.__name__ or
+          any(e["event"] == "MEMORY_REJECTED" for e in am.read_audit(store)),
+          "no MEMORY_REJECTED event")
+
+
+def test_tier23_invariant_provenance_survives() -> None:
+    """INVARIANT 6: source provenance survives import (tag + fingerprint
+    stored on the memory and readable back)."""
+    store = tmp_store()
+    am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    rec = next(r for r in am.list_memories(store) if "diff-gate" in r["title"])
+    check("tier2.3: source.tag survives",
+          rec["source"].get("tag") == "2026-08-12",
+          f"(got {rec['source']})")
+    check("tier2.3: source.type is memory type",
+          rec["source"].get("type") == "error", f"(got {rec['source']})")
+
+
+def test_tier23_invariant_supersession_wired() -> None:
+    """INVARIANT 7: decision-log SUPERSEDES links are preserved where
+    deterministically knowable (same run, active targets)."""
+    store = tmp_store()
+    report = am.import_source_log(store, "decision-log", DECISION_LOG_FIXTURE, project="p")
+    check("tier2.3: supersession links wired", report["superseded"] == 2,
+          f"(got {report['superseded']}, unresolved {report['unresolved_supersedes']})")
+    # AST-after-all is active and supersedes back-to-regex; back-to-regex superseded.
+    ast = next(r for r in am.list_memories(store) if "AST after all" in r["title"])
+    back = next(r for r in am.list_memories(store) if "back to regex" in r["title"])
+    check("tier2.3: AST-after-all active", ast["status"] == "active",
+          f"(got {ast['status']})")
+    check("tier2.3: back-to-regex superseded", back["status"] == "superseded",
+          f"(got {back['status']})")
+    check("tier2.3: AST supersedes back-to-regex",
+          ast.get("supersedes") == back["id"],
+          f"(got {ast.get('supersedes')} vs {back['id']})")
+
+
+def test_tier23_invariant_no_overwrite_of_existing() -> None:
+    """INVARIANT 8: existing manually-created memories are never silently
+    overwritten - import only creates; a same-title manual memory stays."""
+    store = tmp_store()
+    am.create_memory(store, "error", "CI commit-message gate missing",
+                     "manual entry - do not touch", project="p",
+                     provenance="human")
+    am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    manual = next(r for r in am.list_memories(store)
+                  if r["provenance"] == "human")
+    check("tier2.3: manual memory untouched",
+          manual["content"] == "manual entry - do not touch" and
+          manual["source"] is None, f"(got {manual})")
+
+
+def test_tier23_invariant_failures_explicit_auditable() -> None:
+    """INVARIANT 9: import failures are explicit and auditable - bad source
+    is a usage error; IMPORT_RUN audit records counts."""
+    store = tmp_store()
+    try:
+        am.import_source_log(store, "unknown-source", "x", project="p")
+        check("tier2.3: unknown source rejected", False, "no error raised")
+    except am.UsageError:
+        check("tier2.3: unknown source rejected", True, "")
+    am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    events = [e for e in am.read_audit(store) if e["event"] == "IMPORT_RUN"]
+    check("tier2.3: IMPORT_RUN audited", len(events) == 1, f"(got {len(events)})")
+    check("tier2.3: IMPORT_RUN detail",
+          events[0]["detail"]["new"] == 3 and
+          events[0]["detail"]["repository"] == "agent-error-log",
+          f"(got {events[0]['detail']})")
+
+
+def test_tier23_invariant_recall_excludes_untrusted_imports() -> None:
+    """INVARIANT 10: recall continues excluding untrusted material by
+    default - imported memories are invisible until human promotion."""
+    store = tmp_store()
+    am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    check("tier2.3: recall excludes untrusted imports",
+          am.recall_memories(store, "commit message gate") == [],
+          "recall leaked untrusted imports")
+    # human promotion makes it visible
+    rec = next(r for r in am.list_memories(store) if "CI commit" in r["title"])
+    am.promote_trust(store, rec["id"], "approved")
+    res = am.recall_memories(store, "commit message gate")
+    check("tier2.3: promoted import recallable",
+          any(r["id"] == rec["id"] for r in res), f"(got {len(res)})")
+
+
+def test_tier23_invariant_honest_zeros_preserved() -> None:
+    """INVARIANT 11: unknown/irrelevant queries continue producing honest
+    zero results after import (the invariant survives import)."""
+    store = tmp_store()
+    am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE, project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    check("tier2.3: honest zero after import",
+          am.recall_memories(store, "deploy kubernetes cluster") == [],
+          "import broke honest zeros")
+
+
+def test_tier23_dry_run_persists_nothing() -> None:
+    """v0.2 Tier 2.3: --dry-run computes fingerprints/report but persists
+    nothing and writes no audit events."""
+    store = tmp_store()
+    report = am.import_source_log(store, "error-log", ERROR_LOG_FIXTURE,
+                                  project="p", dry_run=True)
+    check("tier2.3: dry-run reports would-create",
+          report["dry_run"] and report["new"] == 3, f"(got {report})")
+    check("tier2.3: dry-run persists nothing", len(am.list_memories(store)) == 0)
+    check("tier2.3: dry-run writes no audit",
+          am.read_audit(store) == [], f"(got {am.read_audit(store)})")
+
+
 
 def test_schema_validation() -> None:
     store = tmp_store()
