@@ -5,6 +5,10 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.2 Tier 2.3, rule-log source - EVIDENCE-023)
+- `import --source rule-log`: the numbered RULES OF ENGAGEMENT (sections
+  1-6 of agent-log-ai/rules.txt) as `constraint` memories - the T9
+  coverage fix (the authoritative layer above the lesson drafts).
 ### Added (v0.2 Tier 2.3 + 2.2, family import - EVIDENCE-003/016/017)
 
 - `import` command: canonical-fingerprint import of agent-error-log,

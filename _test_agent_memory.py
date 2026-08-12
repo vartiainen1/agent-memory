@@ -1217,5 +1217,147 @@ def test_tier22_secret_in_lesson_rejected_before_persist() -> None:
           len(recs) == 1 and all("ghp_" not in str(r.get("content", "")) for r in recs))
 
 
+# === Tier 2.3 rule-log import (EVIDENCE-023) ===
+# The numbered RULES OF ENGAGEMENT (sections 1-6) that sit ABOVE the
+# AI-derived section 7 drafts in agent-log-ai/rules.txt. Found by the T9
+# BB-cell forensics: lesson-log imports only section 7, so the authoritative
+# numbered rules (the AREA-marker gate) never reached the store.
+
+RULES_FIXTURE = (
+    "RULES OF ENGAGEMENT\n"
+    "\n"
+    "1) READ FIRST\n"
+    "   Read rules.txt, then the log, then notes.txt at session start (start.py).\n"
+    "\n"
+    "2) LOG BEFORE FIXING\n"
+    "   If something breaks, log it in the error log first, then fix.\n"
+    "\n"
+    "3) DECIDE BEFORE YOU CODE\n"
+    "   Log decisions in decisions.txt before coding.\n"
+    "\n"
+    "4) NEVER REWRITE HISTORY\n"
+    "   Append-only. Corrections are new entries that point back with SUPERSEDES.\n"
+    "\n"
+    "5) THE AREA-MARKER GATE\n"
+    "   Every commit / PR title carries (AREA: <logged decision>). CI enforces it.\n"
+    "\n"
+    "6) LLM DISCIPLINE\n"
+    "   Dry-run before you send. Never commit an API key. Local-first by default.\n"
+    "\n"
+    "## 7) LESSONS LEARNED (proposed drafts)\n"
+    "\n"
+    "Distilled by check_logs_ai.py - human-confirm before promoting.\n"
+    "\n"
+    "**CLUSTER 1 - ROOT CAUSE:** Inconsistent handling of Unicode streams.\n"
+    "\n"
+    "**CLUSTER 1 - RULE:** *Always pair encoding changes with docs.*\n"
+)
+
+LEAKY_RULE = RULES_FIXTURE.replace(
+    "   Dry-run before you send. Never commit an API key. Local-first by default.",
+    "   Dry-run before you send. Hook token: ghp_12345678901234567890ab.",
+)
+
+
+def test_rulelog_parser_real_format() -> None:
+    """Tier 2.3: the numbered-rules parser reads sections 1-6 (real
+    rules.txt layout: 'N) TITLE' headers, indented bodies, '## 7)'
+    LESSONS marker) and stops at section 7 - the AI draft clusters belong
+    to the lesson-log source, never both."""
+    entries = am._parse_rules_engagement(RULES_FIXTURE.splitlines())
+    check("tier2.3: exactly 6 numbered sections parsed",
+          len(entries) == 6, f"(got {len(entries)})")
+    check("tier2.3: tags RULE 1..6 in file order",
+          [e["tag"] for e in entries] == [f"RULE {n}" for n in range(1, 7)],
+          f"(got {[e['tag'] for e in entries]})")
+    check("tier2.3: title is the section title",
+          entries[4]["title"] == "THE AREA-MARKER GATE",
+          f"(got {entries[4]['title']!r})")
+    check("tier2.3: body is the indented text",
+          "AREA: <logged decision>" in entries[4]["fields"]["BODY"],
+          f"(got {entries[4]['fields']['BODY'][:60]!r})")
+    check("tier2.3: section 7 drafts excluded (lesson source owns them)",
+          all("CLUSTER" not in e["tag"] for e in entries))
+    check("tier2.3: deterministic - second parse identical",
+          am._parse_rules_engagement(RULES_FIXTURE.splitlines()) == entries)
+
+
+def test_rulelog_import_born_untrusted_import_provenance() -> None:
+    """Tier 2.3 INVARIANT: numbered rules are born untrusted with
+    provenance=import and source.repository=agent-log-ai; type=constraint
+    with rule/numbered tags. Import cannot manufacture trust."""
+    store = tmp_store()
+    am.import_source_log(store, "rule-log", RULES_FIXTURE, project="p")
+    recs = am.list_memories(store)
+    check("tier2.3: all 6 rules imported", len(recs) == 6, f"(got {len(recs)})")
+    gate = next(r for r in recs if "AREA-MARKER" in r["title"])
+    check("tier2.3: AREA gate born untrusted",
+          gate["trust"] == "untrusted", f"(got {gate['trust']})")
+    check("tier2.3: provenance import", gate["provenance"] == "import",
+          f"(got {gate['provenance']})")
+    check("tier2.3: type constraint", gate["type"] == "constraint",
+          f"(got {gate['type']})")
+    check("tier2.3: tags rule/numbered",
+          "rule" in gate.get("tags", []) and "numbered" in gate.get("tags", []),
+          f"(got {gate.get('tags')})")
+    src = gate.get("source")
+    check("tier2.3: source agent-log-ai + sha256 fingerprint",
+          isinstance(src, dict) and src.get("repository") == "agent-log-ai"
+          and src.get("fingerprint", "").startswith("sha256:"),
+          f"(got {src})")
+
+
+def test_rulelog_reimport_no_duplicates() -> None:
+    """Tier 2.3 INVARIANT: re-import of the same rules -> no duplicates."""
+    store = tmp_store()
+    r1 = am.import_source_log(store, "rule-log", RULES_FIXTURE, project="p")
+    r2 = am.import_source_log(store, "rule-log", RULES_FIXTURE, project="p")
+    check("tier2.3: first import created 6", r1["new"] == 6, f"(got {r1['new']})")
+    check("tier2.3: re-import all duplicates",
+          r2["new"] == 0 and r2["duplicates"] == 6,
+          f"(new {r2['new']}, dup {r2['duplicates']})")
+    check("tier2.3: total unchanged", len(am.list_memories(store)) == 6)
+
+
+def test_rulelog_recall_excludes_untrusted_rules() -> None:
+    """Tier 2.3 DANGEROUS CASE: untrusted numbered rules are excluded from
+    recall even on a direct match; search still shows them (operator
+    visibility preserved)."""
+    store = tmp_store()
+    am.import_source_log(store, "rule-log", RULES_FIXTURE, project="p")
+    rec = am.recall_memories(store, "commit message area marker")
+    check("tier2.3: recall returns 0 on untrusted rules",
+          rec == [], f"(got {len(rec)})")
+    hits = am.search_memories(store, "area marker gate")
+    check("tier2.3: search still surfaces them for the operator",
+          len(hits) >= 1, f"(got {len(hits)})")
+
+
+def test_rulelog_promotion_grants_recall_access() -> None:
+    """Tier 2.3 DANGEROUS CASE 2: after human approval the AREA-marker rule
+    IS recalled (the T9 fix); unpromoted siblings stay excluded."""
+    store = tmp_store()
+    am.import_source_log(store, "rule-log", RULES_FIXTURE, project="p")
+    gate = next(r for r in am.list_memories(store) if "AREA-MARKER" in r["title"])
+    am.promote_trust(store, gate["id"], "approved")
+    hits = am.recall_memories(store, "commit message area marker")
+    check("tier2.3: approved AREA rule now recalled",
+          any("AREA-MARKER" in h["title"] for h in hits),
+          f"(got {[h['title'][:40] for h in hits]})")
+
+
+def test_rulelog_secret_in_rule_rejected_before_persist() -> None:
+    """Tier 2.3 INVARIANT: secret detection gates rules too - a rule body
+    containing a leaked token is rejected, counted, and never stored."""
+    store = tmp_store()
+    report = am.import_source_log(store, "rule-log", LEAKY_RULE, project="p")
+    check("tier2.3: leaky rule rejected, not persisted",
+          report["rejected"] == 1 and report["new"] == 5,
+          f"(rejected {report['rejected']}, new {report['new']})")
+    check("tier2.3: 5 clean rules stored",
+          len(am.list_memories(store)) == 5, f"(got {len(am.list_memories(store))})")
+
+
 if __name__ == "__main__":
     sys.exit(main())
+

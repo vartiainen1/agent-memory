@@ -64,11 +64,11 @@ DEFAULT_SEARCH_LIMIT = 50
 PATH_BONUS = 10
 
 # Family import (V0.1_SPEC.md section 14, v0.2 Tier 2.3 - EVIDENCE-003/016).
-IMPORT_SOURCES = ("error-log", "decision-log", "lesson-log")
+IMPORT_SOURCES = ("error-log", "decision-log", "lesson-log", "rule-log")
 IMPORT_REPOS = {"error-log": "agent-error-log", "decision-log": "agent-decision-log",
-               "lesson-log": "agent-log-ai"}
+               "lesson-log": "agent-log-ai", "rule-log": "agent-log-ai"}
 IMPORT_LOG_FILES = {"error-log": "errors.txt", "decision-log": "decisions.txt",
-                   "lesson-log": "rules.txt"}
+                   "lesson-log": "rules.txt", "rule-log": "rules.txt"}
 
 # Secret detection (V0.1_SPEC.md section 5) - best-effort, documented imperfect.
 SECRET_PATTERNS = [
@@ -804,6 +804,11 @@ _LESSON_CLUSTER_RE = re.compile(
 )
 _LESSON_SEP_RE = re.compile(r"^\s*-{3,}$")
 
+# rule-log source (v0.2 Tier 2.3, EVIDENCE-023): the numbered engagement
+# sections 1-6 of rules.txt (section 7 drafts belong to lesson-log).
+_RULE_SECTION_RE = re.compile(r"^(\d+)\)\s+(.+)$")
+_LESSONS_MARKER_RE = re.compile(r"^#+\s*\d+\)\s*LESSONS", re.IGNORECASE)
+
 
 def _canonical_bytes(block: str) -> bytes:
     """Canonical bytes of a source entry for fingerprinting (spec 14.2).
@@ -838,6 +843,8 @@ def _parse_source_log(source: str, text: str) -> list[dict]:
     entry_re = _ERROR_ENTRY_RE if source == "error-log" else _DECISION_ENTRY_RE
     if source == "lesson-log":
         return _parse_lesson_drafts(text.splitlines())
+    if source == "rule-log":
+        return _parse_rules_engagement(text.splitlines())
     lines = text.splitlines()
     entries: list[dict] = []
     i, n = 0, len(lines)
@@ -924,6 +931,47 @@ def _parse_lesson_drafts(lines: list[str]) -> list[dict]:
     return out
 
 
+def _parse_rules_engagement(lines: list[str]) -> list[dict]:
+    """Parse rules.txt numbered RULES OF ENGAGEMENT (sections 1-6) into
+    entry dicts, in file order.
+
+    A numbered section is 'N) TITLE' at column 0 plus its indented body,
+    running until the next 'N)' header. Parsing stops at the '## 7)'
+    LESSONS LEARNED marker: section 7 draft clusters belong to the
+    lesson-log source, never both. Leading prose and blank lines are
+    ignored. Deterministic.
+    """
+    entries: list[dict] = []
+    cur: dict | None = None
+    for line in lines:
+        if _LESSONS_MARKER_RE.match(line) or _LESSON_CLUSTER_RE.match(line):
+            break  # section 7 drafts can never become constraint rules
+        m = _RULE_SECTION_RE.match(line)
+        if m:
+            if m.group(2).lstrip().upper().startswith("LESSONS"):
+                break  # bare "N) LESSONS..." header without '#'
+            if cur is not None:
+                entries.append(cur)
+            cur = {"tag": f"RULE {m.group(1)}", "title": m.group(2).strip(),
+                   "body": [], "block": [line]}
+            continue
+        if cur is not None and line.strip():
+            cur["body"].append(line.strip())
+            cur["block"].append(line)
+    if cur is not None:
+        entries.append(cur)
+    out: list[dict] = []
+    for e in entries:
+        block = "\n".join(b for b in e["block"] if b.strip())
+        out.append({
+            "tag": e["tag"],
+            "block": block,
+            "fields": {"RULE": e["title"], "BODY": " ".join(e["body"])},
+            "title": e["title"],
+        })
+    return out
+
+
 def _entry_to_memory(source: str, entry: dict) -> dict:
     """Map a parsed source entry to create_memory kwargs (boring mapping)."""
     fields = entry["fields"]
@@ -937,6 +985,11 @@ def _entry_to_memory(source: str, entry: dict) -> dict:
                  f"RULE: {fields.get('RULE', '')}"]
         mem_type = "lesson"
         tags = ["ai-draft", "unconfirmed"]
+        paths: list[str] = []
+    elif source == "rule-log":
+        parts = [fields.get("BODY", "")]
+        mem_type = "constraint"
+        tags = ["rule", "numbered"]
         paths: list[str] = []
     else:
         parts = [f"REASON: {fields['REASON']}" if fields.get("REASON") else "",
@@ -1147,7 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--trust", choices=("verified", "approved"), required=True)
     p_promote.add_argument("--json", action="store_true")
 
-    p_import = sub.add_parser("import", help="import a family log (error-log / decision-log / lesson-log)")
+    p_import = sub.add_parser("import", help="import a family log (error-log / decision-log / lesson-log / rule-log)")
     p_import.add_argument("path", help="sibling log file (errors.txt / decisions.txt) or its directory")
     p_import.add_argument("--source", choices=IMPORT_SOURCES, required=True,
                           help="which family log format to parse")
