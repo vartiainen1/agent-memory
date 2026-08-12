@@ -7,3 +7,6 @@ dist/
 venv/
 .pytest_cache/
 .coverage
+
+# internal idea/history doc - never shipped
+IDEA.txt
