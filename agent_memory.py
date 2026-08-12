@@ -585,9 +585,73 @@ def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str 
     return records
 
 
-def _hit_count(text: str, query_terms: list[str]) -> int:
+PHRASE_BONUS = 2.0  # per contiguous adjacent query pair found in a field
+
+
+def _term_doc_freqs(records: list[dict], terms: list[str]) -> dict[str, int]:
+    """df(t): number of candidate records whose title/tags/content contain t."""
+    df = {t: 0 for t in terms}
+    for r in records:
+        blob = " ".join((
+            r.get("title", ""),
+            " ".join(r.get("tags", [])),
+            r.get("content", ""),
+        )).lower()
+        for t in terms:
+            if t in blob:
+                df[t] += 1
+    return df
+
+
+def _idf_weights(n: int, df: dict[str, int]) -> dict[str, float]:
+    """Smooth IDF: idf(t) = ln(n / (df(t) + 1)) + 1; common tokens approach 1.
+
+    Deterministic pure function of the candidate set (v0.2 Tier 1,
+    EVIDENCE-012/013): a token present in many memories is downweighted, a
+    distinctive token carries more signal.
+    """
+    if n < 1:
+        return {t: 0.0 for t in df}
+    return {t: math.log(n / (df[t] + 1)) + 1.0 for t in df}
+
+
+def _field_score(text: str, terms: list[str], idf: dict[str, float]) -> float:
+    """Field score: IDF-weighted term hits plus phrase (contiguous-pair) bonus."""
     lower = text.lower()
-    return sum(lower.count(term) for term in query_terms)
+    score = sum(lower.count(t) * idf[t] for t in terms)
+    for i in range(len(terms) - 1):
+        if f"{terms[i]} {terms[i + 1]}" in lower:
+            score += PHRASE_BONUS
+    return score
+
+
+def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
+                  path: str | None = None) -> list[dict]:
+    """Deterministic relevance ranking shared by search and recall (Tier 1).
+
+    Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
+    a phrase bonus; +PATH_BONUS when --path matches. Scores round to 6
+    decimals for cross-platform-stable ordering; exact ties break on
+    (created_at, id) desc. Honest zero results: score <= 0 (no term hits, no
+    path match) is excluded - recall never invents context (EVIDENCE-003).
+    """
+    scored = []
+    for r in records:
+        tags_text = " ".join(r.get("tags", []))
+        score = (3.0 * _field_score(r.get("title", ""), terms, idf)
+                 + 2.0 * _field_score(tags_text, terms, idf)
+                 + 1.0 * _field_score(r.get("content", ""), terms, idf))
+        if path:
+            for pat in r.get("paths", []):
+                if path_matches(pat, path):
+                    score += PATH_BONUS
+                    break
+        if score > 0:
+            scored.append((round(score, 6), r))
+    scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""),
+                                  pair[1].get("title", ""),
+                                  pair[1].get("id", "")), reverse=True)
+    return [r for _, r in scored]
 
 
 def _check_limit(limit: int) -> None:
@@ -616,17 +680,8 @@ def search_memories(
         records = [r for r in records if r.get("status") == status]
     else:
         records = [r for r in records if r.get("status") in ("active", "superseded")]
-    scored = []
-    for r in records:
-        tags_text = " ".join(r.get("tags", []))
-        score = 3 * _hit_count(r.get("title", ""), terms) + \
-                2 * _hit_count(tags_text, terms) + \
-                1 * _hit_count(r.get("content", ""), terms)
-        if score > 0:
-            scored.append((score, r))
-    scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""), pair[1].get("id", "")), reverse=True)
-    result = [r for _, r in scored]
-    return result[:limit]
+    idf = _idf_weights(len(records), _term_doc_freqs(records, terms))
+    return _rank_records(records, terms, idf)[:limit]
 
 
 def recall_memories(
@@ -646,22 +701,8 @@ def recall_memories(
     records = list_memories(store, status="active")
     if not include_untrusted:
         records = [r for r in records if r.get("trust") != "untrusted"]
-    scored = []
-    for r in records:
-        tags_text = " ".join(r.get("tags", []))
-        score = 3 * _hit_count(r.get("title", ""), terms) + \
-                2 * _hit_count(tags_text, terms) + \
-                1 * _hit_count(r.get("content", ""), terms)
-        if path:
-            for pat in r.get("paths", []):
-                if path_matches(pat, path):
-                    score += PATH_BONUS
-                    break
-        if score > 0:
-            scored.append((score, r))
-    scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""), pair[1].get("id", "")), reverse=True)
-    result = [r for _, r in scored]
-    return result[:limit]
+    idf = _idf_weights(len(records), _term_doc_freqs(records, terms))
+    return _rank_records(records, terms, idf, path=path)[:limit]
 
 
 def status_summary(store: pathlib.Path) -> dict:

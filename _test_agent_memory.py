@@ -442,8 +442,8 @@ def test_deterministic_ordering() -> None:
     # Contract: ordering is (score, created_at, id) desc. Score is equal here,
     # so ids must be ordered by (created_at, id) desc - true even across
     # second boundaries (unlike the old id-only assertion, which was flaky).
-    keys = [(r["created_at"], r["id"]) for r in r1]
-    check("determinism: (created_at, id) desc ordering", keys == sorted(keys, reverse=True), f"(got {keys})")
+    keys = [(r["created_at"], r["title"], r["id"]) for r in r1]
+    check("determinism: (created_at, title, id) desc ordering", keys == sorted(keys, reverse=True), f"(got {keys})")
 
     # Explicit same-second tie -> id tie-break applies deterministically.
     store2 = tmp_store()
@@ -452,9 +452,100 @@ def test_deterministic_ordering() -> None:
         rec["created_at"] = "2026-08-12T00:00:00Z"
         am.save_memory(store2, rec)
     tied = am.recall_memories(store2, "auth")
-    got = [r["id"] for r in tied]
-    check("determinism: same-second tie breaks on id desc", got == sorted(got, reverse=True), f"(got {got})")
+    got = [(r["title"], r["id"]) for r in tied]
+    # v0.2 Tier 1: equal-score ties break on (created_at, title, id) desc -
+    # content-derived title before the random id (cross-store stable).
+    check("determinism: same-second tie breaks on (title, id) desc",
+          got == sorted(got, reverse=True), f"(got {got})")
 
+
+
+
+
+def test_idf_downweights_common_token() -> None:
+    """v0.2 Tier 1: a token shared by many memories carries less signal."""
+    store = tmp_store()
+    # 4 memories share 'gate' (common token); only one also mentions 'merge'.
+    for i in range(4):
+        am.create_memory(store, "error", f"generic gate issue {i}", "gate handling",
+                         project="p", tags=["gate"])
+    rare = am.create_memory(store, "error", "merge-commit gate blocks push",
+                            "gate rejected the merge", project="p", tags=["gate", "merge"])
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    # 'merge' is distinctive (1/5 docs); 'gate' is common (5/5).
+    results = am.recall_memories(store, "merge gate")
+    check("idf: distinctive token ranks the merge memory first",
+          results[0]["id"] == rare["id"], f"(got {results[0]['title']})")
+
+
+def test_phrase_bonus_ranks_contiguous_first() -> None:
+    """v0.2 Tier 1: contiguous query terms in a field earn the phrase bonus."""
+    store = tmp_store()
+    a = am.create_memory(store, "decision", "deploy green blue to prod",
+                         "green blue deploy", project="p")
+    am.create_memory(store, "decision", "blue sky deploy green",
+                     "deploy happens after blue and green", project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "green blue")
+    check("phrase: contiguous 'green blue' ranks first",
+          results[0]["id"] == a["id"], f"(got {results[0]['title']})")
+
+
+def test_idf_keeps_honest_zero_results() -> None:
+    """v0.2 Tier 1 invariant: improved recall must NOT degrade honest zeros."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "auth via service", "login flow",
+                     project="p", tags=["auth"])
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "deploy kubernetes cluster")
+    check("tier1: unknown domain -> honest 0 results", results == [])
+
+
+def test_idf_tie_break_still_deterministic() -> None:
+    """v0.2 Tier 1: equal scores break on (created_at, title, id) desc."""
+    store = tmp_store()
+    for title in ("Alpha auth", "Beta auth", "Gamma auth"):
+        rec = am.create_memory(store, "decision", title, "about auth", project="p")
+        am.promote_trust(store, rec["id"], "approved")
+    # All three contain 'auth' -> identical idf and hits -> equal scores.
+    # Tie-break is (created_at, title, id) desc - title is stable across stores
+    # (unlike random UUID ids).
+    r1 = am.recall_memories(store, "auth")
+    keys = [(r["created_at"], r["title"], r["id"]) for r in r1]
+    check("tier1: equal-score tie breaks on (created_at, title, id) desc",
+          keys == sorted(keys, reverse=True), f"(got {keys})")
+
+
+
+def test_search_shares_idf_scoring() -> None:
+    """v0.2 Tier 1: search_memories ranks a rare-token memory above a
+    common-token one with equal hit counts (same scorer as recall)."""
+    store = tmp_store()
+    am.create_memory(store, "error", "gate handling", "gate pipeline",
+                     project="p", tags=["gate"])
+    rare = am.create_memory(store, "error", "merge handling", "merge pipeline",
+                            project="p", tags=["merge"])
+    results = am.search_memories(store, "merge gate")
+    check("search: rare-token memory ranks first (IDF parity)",
+          results[0]["id"] == rare["id"], f"(got {results[0]['title']})")
+
+
+def test_idf_ubiquitous_term_still_ranked() -> None:
+    """v0.2 Tier 1 acceptance: a term present in EVERY candidate still ranks
+    (idf ~ 1, not 0) - no accidental honest-zero regression for ubiquitous
+    vocabulary."""
+    store = tmp_store()
+    for i in range(5):
+        am.create_memory(store, "decision", f"auth memory {i}", "about auth",
+                         project="p", tags=["auth"])
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "auth")
+    check("tier1: ubiquitous term still returns results",
+          len(results) == 5, f"(got {len(results)})")
 
 # --------------------------------------------------------------------------
 # 8. Path matcher

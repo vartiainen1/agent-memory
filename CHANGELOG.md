@@ -4,6 +4,15 @@ All notable changes to agent-memory are documented here. The version at the
 top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
+## [Unreleased]
+
+### Added (v0.2 Tier 1, retrieval - EVIDENCE-012/013)
+
+- IDF/common-token downweighting + phrase bonus in deterministic
+  search/recall scoring; honest zero results preserved.
+- Equal-score tie-break contract tightened to (score, created_at, title,
+  id) desc so ordering is stable across store clones (no UUID exposure).
+
 ## [0.1.0] - 2026-08-12
 
 ### Added

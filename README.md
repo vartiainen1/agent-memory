@@ -199,7 +199,7 @@ manual via `add --provenance import`.)
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (136 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (142 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
 ```
 
