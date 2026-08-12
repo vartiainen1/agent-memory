@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-memory"
+dynamic = ["version"]
+description = "Local-first knowledge and governance layer for AI coding agents - persistent project memory with trust, history, and authority under system and human control"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+keywords = ["ai", "agents", "claude", "llm", "memory", "cli", "knowledge", "governance"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/vartiainen1/agent-memory"
+Repository = "https://github.com/vartiainen1/agent-memory"
+
+[project.scripts]
+agent-memory = "agent_memory:main"
+
+[tool.setuptools]
+py-modules = ["agent_memory"]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0"

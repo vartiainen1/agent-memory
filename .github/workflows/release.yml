@@ -1,0 +1,71 @@
+name: Release
+
+# Creates a git tag + draft GitHub Release whenever the version at the top of
+# CHANGELOG.md is bumped. The single source of truth for versions is
+# CHANGELOG.md — no package.json / setup.py to keep in sync.
+#
+# Flow: bump the version in CHANGELOG.md, push to main → this workflow tags it
+# (vX.Y.Z) and opens a DRAFT release with that changelog section as the body.
+# Drafts stay private until you edit + publish them on the Releases page, so a
+# stray push can never announce something by accident.
+#
+# If you fork this repo, add an owner guard to the job so forks don't tag
+# their own releases:
+#   if: github.repository_owner == '<your-org>'
+on:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: write # create tags and releases
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Version = first "## [X.Y.Z]" header that isn't [Unreleased].
+      - name: Extract version from CHANGELOG.md
+        id: version
+        run: |
+          ver=$(awk '/^## /{ line=$0; end=index(line, "]"); if (end > 4) { v=substr(line, 5, end - 5); if (v != "Unreleased") { print v; exit } } }' CHANGELOG.md)
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "no released version in CHANGELOG.md - nothing to release"
+            exit 0
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag does not exist
+        id: tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "tag v${{ steps.version.outputs.version }} already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create git tag
+        if: steps.version.outputs.version != '' && steps.tag.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Open draft release
+        if: steps.version.outputs.version != '' && steps.tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          draft: true
+          body_path: /dev/null
+          generate_release_notes: false
