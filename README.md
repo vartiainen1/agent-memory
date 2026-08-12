@@ -115,8 +115,7 @@ byte-identical determinism.
 
 ## Status
 
-v0.1 (alpha). See `V0.1_SPEC.md` for the implementation contract and
-`IDEA.txt` for the vision and decision history.
+v0.1 (alpha). `V0.1_SPEC.md` is the implementation contract.
 
 ## License
 
