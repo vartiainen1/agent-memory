@@ -91,7 +91,7 @@ agent-memory recall "auth" --path src/auth/login.py
 | `search QUERY [--type T] [--status S] [--limit N] [--json]` | operator textual search (limit 50) |
 | `recall QUERY [--path P] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only) |
 | `promote <mem_id> --trust verified\|approved` | human trust promotion (never `system`) |
-| `supersede <old_id> <new_id>` | bidirectional supersession; no chains in v0.1 |
+| `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
 | `status [--json]` | store health + counts |
 
@@ -174,8 +174,22 @@ agent-memory is the persistent knowledge layer of the agent-tool family:
 - **`agent-memory` — persists, organizes, trusts, retrieves, relates knowledge**
 - `agent-diff-gate` — enforces constraints against changes
 
-Family-repo import is v0.2; v0.1 ships provenance/fingerprint fields
-schema-ready but unpopulated.
+The family works as a loop: the log repositories record what happened,
+agent-memory turns that history into trusted, retrievable knowledge, an
+agent consumes it as context before changing code, and agent-diff-gate
+enforces the stored constraints against the proposed change:
+
+```
+  error-log ──┐
+decision-log ─┼──▶ agent-memory ──recall──▶ AI agent ──proposed change──▶ agent-diff-gate
+   log-ai ────┘         │  ▲                     │                            │
+                        │  └── trusted context    │                            ▼
+                        └───────── constraints ───┴─────────────────────▶ PASS / BLOCK
+```
+
+(Import of the family logs into agent-memory is v0.2; v0.1 ships
+provenance/fingerprint fields schema-ready but unpopulated, and seeding is
+manual via `add --provenance import`.)
 
 ## Requirements
 
