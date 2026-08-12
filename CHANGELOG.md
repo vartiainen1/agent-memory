@@ -4,7 +4,7 @@ All notable changes to agent-memory are documented here. The version at the
 top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
-## [Unreleased]
+## [0.1.0] - 2026-08-12
 
 ### Added
 
