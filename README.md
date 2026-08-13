@@ -18,7 +18,8 @@ memory, but the AI must not have unrestricted authority over memory.**
 - **Structured** — DECISION / ERROR / LESSON / CONSTRAINT / ARCHITECTURE / PATTERN
   memories with typed metadata (provenance, trust, severity, paths, tags).
 - **Trusted** — AI/imported knowledge starts `untrusted`; only a human can
-  promote trust. Agents can never promote themselves.
+  promote trust. Agents can propose memories via a suggestion queue but
+  can never promote or approve themselves.
 - **Auditable** — immutable history (supersede, never rewrite), append-only
   audit log, secrets rejected before storage.
 - **Agent- and model-agnostic** — a boring, deterministic CLI any agent can
@@ -98,7 +99,8 @@ agent-memory recall "auth" --path src/auth/login.py
 | `import PATH --source error-log\|decision-log\|lesson-log\|rule-log` | family import (untrusted, provenance-tracked, idempotent) |
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
-| `status [--json]` | store health + counts |
+| `suggestions list \| approve <sug_id> --trust verified\|approved \| reject <sug_id>` | human review of agent suggestions (T3 approve-to-persist loop) |
+| `status [--json]` | store health + counts (incl. pending suggestions) |
 
 Exit codes: `0` success · `1` runtime error · `2` usage error.
 Every command supports `--json` for machine-readable output.
@@ -238,12 +240,19 @@ to AI coding agents through the official MCP SDK:
 
 - Tools: `memory_recall`, `memory_search`, `memory_get`, `memory_history`,
   `memory_suggest`, `memory_create`, `memory_validate`
-- The tool surface IS the permission boundary: `delete` and `promote` are
-  never exposed to agents - promotion stays human-only, deletion stays
-  CLI-only
-- `memory_suggest` returns a validated candidate preview without
-  persisting (the AI proposes; the system decides what becomes
-  authoritative)
+- The tool surface IS the permission boundary: `delete`, `promote`,
+  `supersede`, `import`, and the T3 suggestion review commands are never
+  exposed to agents - promotion/approval stay human-only (CLI), deletion
+  stays CLI-only
+- `memory_suggest` enqueues a validated, secret-screened **pending
+  suggestion** (T3 approve-to-persist loop, EVIDENCE-034): the AI
+  proposes, only a human converts it into a memory (`suggestions
+  approve <id> --trust verified|approved`). A suggestion is not a
+  memory - it carries no trust/status and never enters recall until
+  approved. An agent can never approve its own suggestion.
+- `memory_create` remains a documented lower-level escape hatch for
+  deliberate integrations: it persists an untrusted agent memory
+  directly, which a human must later promote before trusted use
 - Every call goes through the core pipeline: validation, secret
   detection (never overridable), trust rules, audit (actor = agent)
 
@@ -262,9 +271,9 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (257 checks)
-python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
-python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (63 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (302 checks)
+python _audit_cli.py           # external-API audit, real binary via subprocess (140 checks)
+python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (70 checks)
 ```
 
 `_audit_cli.py` treats the CLI as an external API: every check runs the real

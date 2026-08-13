@@ -18,6 +18,7 @@ Contract: V0.1_SPEC.md in this repo. Run from a project folder:
     python agent_memory.py promote <mem_id> --trust verified|approved
     python agent_memory.py supersede <old_id> <new_id>
     python agent_memory.py delete <mem_id> [--purge]
+    python agent_memory.py suggestions list|approve <sug_id> --trust verified|approved|reject <sug_id>
     python agent_memory.py status [--json]
 
 Exit codes: 0 = success, 1 = runtime error, 2 = usage error.
@@ -52,6 +53,14 @@ AGENT_DIR = ".agent"
 MEMORY_SUBDIR = "memory"
 CONFIG_FILE = "config.toml"
 AUDIT_FILE = "audit.jsonl"
+
+# T3 suggestions (v0.3 Tier 3, EVIDENCE-034): a suggestion is NOT a memory.
+# It lives in .agent/suggestions/ (separate subdir, separate schema - no
+# trust/status), never participates in recall/trust/supersession/lifecycle,
+# and only a human can convert it into a real memory. No new memory status.
+SUGGESTION_PREFIX = "sug_"
+SUGGESTION_SUBDIR = "suggestions"
+SUGGESTION_STATES = ("pending", "approved", "rejected")
 
 MEMORY_TYPES = ("decision", "error", "lesson", "constraint", "architecture", "pattern")
 PROVENANCES = ("human", "agent", "import", "system", "external")
@@ -135,6 +144,11 @@ def now_utc() -> str:
 def new_id() -> str:
     """mem_<uuid4> (ROUND 3 #3)."""
     return MEMORY_PREFIX + str(uuid.uuid4())
+
+
+def new_suggestion_id() -> str:
+    """sug_<uuid4> (T3 - distinct id space from memories)."""
+    return SUGGESTION_PREFIX + str(uuid.uuid4())
 
 
 def shannon_entropy(text: str) -> float:
@@ -373,6 +387,7 @@ def init_store(target: pathlib.Path | None = None, project: str | None = None, f
         store.mkdir(parents=True, exist_ok=True)
     for t in MEMORY_TYPES:
         (store / MEMORY_SUBDIR / t).mkdir(parents=True, exist_ok=True)
+    (store / SUGGESTION_SUBDIR).mkdir(parents=True, exist_ok=True)
     project_name = project or root.name
     config = {"project": project_name, "recall_limit": DEFAULT_RECALL_LIMIT, "include_untrusted": False}
     _write_text_utf8(store / CONFIG_FILE, _dump_toml(config))
@@ -621,6 +636,173 @@ def delete_memory(store: pathlib.Path, mem_id: str, purge: bool = False, actor: 
     return record
 
 
+# --------------------------------------------------------------------------
+# T3 suggestions (v0.3 Tier 3, EVIDENCE-034 - approve-to-persist loop)
+# --------------------------------------------------------------------------
+# A suggestion is a CANDIDATE proposed by an agent, not a memory: it carries
+# no trust/status, never participates in recall/trust ranking/supersession/
+# lifecycle/history until a HUMAN converts it into a real memory. The queue
+# must not become a backdoor persistence mechanism: propose validates +
+# secret-screens BEFORE writing, pins provenance to agent, never assigns
+# trust, and approval/rejection are human-only, audited, and TERMINAL.
+
+def propose_suggestion(
+    store: pathlib.Path,
+    mem_type: str,
+    title: str,
+    content: str,
+    project: str,
+    severity: str = "normal",
+    tags: list[str] | None = None,
+    paths: list[str] | None = None,
+    actor: str = "agent",
+) -> dict:
+    """Validate + secret-screen + enqueue a pending suggestion.
+
+    A suggestion is NOT a memory: it is written to .agent/suggestions/
+    sug_<uuid>.json with NO trust/status fields (the memory schema is
+    untouched). provenance is hard-pinned to 'agent' - only agents propose
+    suggestions. Secret material is rejected BEFORE any write (never
+    persisted) and audited as SUGGESTION_REJECTED. Raises on rejection.
+    """
+    if mem_type not in MEMORY_TYPES:
+        raise UsageError(f"invalid type {mem_type!r}: must be one of {', '.join(MEMORY_TYPES)}")
+    if severity not in SEVERITIES:
+        raise UsageError(f"invalid severity {severity!r}: must be one of {', '.join(SEVERITIES)}")
+    if not isinstance(title, str) or not title.strip():
+        raise UsageError("title must be a non-empty string")
+    if not isinstance(content, str) or not content.strip():
+        raise UsageError("content must be a non-empty string")
+    for p in (paths or []):
+        validate_path_pattern(p)
+
+    detected = detect_secret(title, content)
+    if detected:
+        append_audit(store, "SUGGESTION_REJECTED", None, actor,
+                     {"reason": "secret_detected", "detail": detected})
+        raise AgentMemoryError("Suggestion rejected: potential secret detected.")
+
+    timestamp = now_utc()
+    sug = {
+        "format_version": FORMAT_VERSION,
+        "id": new_suggestion_id(),
+        "type": mem_type,
+        "title": title.strip(),
+        "content": content.strip(),
+        "project": project,
+        "provenance": "agent",  # pinned: only agents propose suggestions
+        "severity": severity,
+        "tags": tags or [],
+        "paths": paths or [],
+        "created_at": timestamp,
+        "state": "pending",
+        "approved_at": None,
+        "approved_by": None,
+        "rejected_at": None,
+        "rejected_by": None,
+    }
+    path = store / SUGGESTION_SUBDIR / f"{sug['id']}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_utf8(path, json.dumps(sug, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "SUGGESTION_CREATED", None, actor,
+                 {"suggestion_id": sug["id"]})
+    return sug
+
+
+def load_suggestion(store: pathlib.Path, sug_id: str) -> dict:
+    """Load one suggestion by id."""
+    path = store / SUGGESTION_SUBDIR / f"{sug_id}.json"
+    if not path.exists():
+        raise AgentMemoryError(f"no suggestion with id {sug_id}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise AgentMemoryError(f"corrupt suggestion file {path}: {exc}") from exc
+
+
+def list_suggestions(store: pathlib.Path, state: str | None = None) -> list[dict]:
+    """List suggestions, newest first (id as final tie-break for determinism)."""
+    folder = store / SUGGESTION_SUBDIR
+    suggestions: list[dict] = []
+    if folder.is_dir():
+        for f in folder.glob("*.json"):
+            try:
+                suggestions.append(json.loads(f.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
+                raise AgentMemoryError(f"corrupt suggestion file {f}")
+    if state:
+        suggestions = [s for s in suggestions if s.get("state") == state]
+    suggestions.sort(key=lambda s: (s.get("created_at", ""), s.get("id", "")),
+                     reverse=True)
+    return suggestions
+
+
+def approve_suggestion(store: pathlib.Path, sug_id: str, trust: str, actor: str = "human") -> dict:
+    """Human-only conversion of a pending suggestion into a real memory.
+
+    The human EXPLICITLY chooses the resulting trust level (verified or
+    approved - never 'system'); approval is NOT automatically max trust.
+    The created memory is born untrusted then promoted through the existing
+    trust ladder (promote_trust), so the trust-transition rules govern. The
+    stored proposal is re-validated and re-screened for secrets (defense
+    against disk tampering). Terminal: only pending suggestions can be
+    approved. Returns the created memory record.
+    """
+    if trust not in ("verified", "approved"):
+        raise UsageError("approve --trust must be 'verified' or 'approved' (never 'system')")
+    sug = load_suggestion(store, sug_id)
+    if sug.get("state") != "pending":
+        raise AgentMemoryError(
+            f"cannot approve {sug_id}: state is {sug.get('state')}; only pending suggestions can be approved"
+        )
+    detected = detect_secret(sug.get("title", ""), sug.get("content", ""))
+    if detected:
+        raise AgentMemoryError(
+            f"refusing to approve {sug_id}: secret detected in the stored proposal"
+        )
+    record = create_memory(
+        store=store,
+        mem_type=sug["type"],
+        title=sug["title"],
+        content=sug["content"],
+        project=sug.get("project", store.parent.name),
+        provenance="agent",  # the knowledge originated from the agent proposal
+        severity=sug.get("severity", "normal"),
+        tags=sug.get("tags", []),
+        paths=sug.get("paths", []),
+        actor=actor,
+    )
+    if record["trust"] != trust:
+        record = promote_trust(store, record["id"], trust, actor=actor)
+    timestamp = now_utc()
+    sug["state"] = "approved"
+    sug["approved_at"] = timestamp
+    sug["approved_by"] = actor
+    _write_text_utf8(store / SUGGESTION_SUBDIR / f"{sug_id}.json",
+                     json.dumps(sug, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "SUGGESTION_APPROVED", record["id"], actor,
+                 {"suggestion_id": sug_id, "trust": trust})
+    return record
+
+
+def reject_suggestion(store: pathlib.Path, sug_id: str, actor: str = "human") -> dict:
+    """Human-only terminal rejection: discards the proposal, audited."""
+    sug = load_suggestion(store, sug_id)
+    if sug.get("state") != "pending":
+        raise AgentMemoryError(
+            f"cannot reject {sug_id}: state is {sug.get('state')}; only pending suggestions can be rejected"
+        )
+    timestamp = now_utc()
+    sug["state"] = "rejected"
+    sug["rejected_at"] = timestamp
+    sug["rejected_by"] = actor
+    _write_text_utf8(store / SUGGESTION_SUBDIR / f"{sug_id}.json",
+                     json.dumps(sug, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "SUGGESTION_REJECTED", None, actor,
+                 {"suggestion_id": sug_id, "reason": "human_review"})
+    return sug
+
+
 def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str | None = None) -> list[dict]:
     """List memory records, newest first (id as final tie-break for determinism)."""
     records: list[dict] = []
@@ -801,6 +983,7 @@ def status_summary(store: pathlib.Path) -> dict:
         by_status[r.get("status", "?")] = by_status.get(r.get("status", "?"), 0) + 1
         by_trust[r.get("trust", "?")] = by_trust.get(r.get("trust", "?"), 0) + 1
     config = load_config(store)
+    suggestions = list_suggestions(store)
     return {
         "project": config.get("project", store.parent.name),
         "store": str(store),
@@ -809,6 +992,7 @@ def status_summary(store: pathlib.Path) -> dict:
         "by_status": by_status,
         "by_trust": by_trust,
         "audit_events": len(read_audit(store)),
+        "suggestions_pending": sum(1 for s in suggestions if s.get("state") == "pending"),
     }
 
 
@@ -1255,6 +1439,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="store health + counts")
     p_status.add_argument("--json", action="store_true")
 
+    p_sug = sub.add_parser("suggestions",
+                           help="human review of agent suggestions (T3 approve-to-persist loop)")
+    p_sug.add_argument("action", choices=("list", "approve", "reject"))
+    p_sug.add_argument("sug_id", nargs="?", help="suggestion id (approve/reject)")
+    p_sug.add_argument("--trust", choices=("verified", "approved"),
+                       help="resulting trust level (approve only - never 'system')")
+    p_sug.add_argument("--state", choices=SUGGESTION_STATES, help="filter (list only)")
+    p_sug.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -1435,6 +1628,34 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"deleted {args.mem_id} (tombstone)")
             return 0
+        if args.command == "suggestions":
+            if args.action == "list":
+                sugs = list_suggestions(store, state=args.state)
+                if args.json:
+                    _emit_json({"results": sugs, "count": len(sugs)})
+                else:
+                    for s in sugs:
+                        print(f"{s['id']}  [{s['type']}] {s['title']} (state={s['state']})")
+                    print(f"{len(sugs)} result(s)" if sugs else "0 results")
+                return 0
+            if not args.sug_id:
+                raise UsageError(f"suggestions {args.action} requires a suggestion id")
+            if args.action == "approve":
+                if not args.trust:
+                    raise UsageError("suggestions approve requires --trust verified|approved")
+                record = approve_suggestion(store, args.sug_id, args.trust)
+                if args.json:
+                    _emit_json(record)
+                else:
+                    print(f"approved {args.sug_id} -> memory {record['id']} (trust={record['trust']})")
+            else:
+                sug = reject_suggestion(store, args.sug_id)
+                if args.json:
+                    _emit_json(sug)
+                else:
+                    print(f"rejected {args.sug_id}")
+            return 0
+
         if args.command == "status":
             summary = status_summary(store)
             if args.json:
@@ -1444,6 +1665,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"store         : {summary['store']}")
                 print(f"total memories: {summary['total']}")
                 print(f"audit events  : {summary['audit_events']}")
+                print(f"pending sugg  : {summary['suggestions_pending']}")
                 print("by type      : " + ", ".join(f"{k}={v}" for k, v in summary['by_type'].items()))
                 print("by status    : " + ", ".join(f"{k}={v}" for k, v in summary['by_status'].items()))
                 print("by trust     : " + ", ".join(f"{k}={v}" for k, v in summary['by_trust'].items()))

@@ -1,9 +1,11 @@
 """Tests for agent_memory_mcp.py - the v0.3 Tier 1 MCP adapter.
 
 Covers the permission surface (exactly ALLOWED_TOOLS, no delete/promote/
-supersede/import), the security invariants (provenance forced to agent,
-secrets never overridable, suggest never persists, audit actor = agent),
-the JSON protocol contract, and the store-absent error path.
+supersede/import, and no approve/reject - an agent can never approve its
+own suggestion), the security invariants (provenance forced to agent,
+secrets never overridable, suggest enqueues a PENDING SUGGESTION - never
+a memory, audit actor = agent), the JSON protocol contract, and the
+store-absent error path.
 
 Most tests exercise the plain tool handler functions directly (they do not
 require the mcp SDK). The tool-surface test builds the real FastMCP server
@@ -186,34 +188,48 @@ def test_history_bad_limit_is_clean_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# suggest: candidate semantics - propose but NEVER persist
+# suggest: T3 approve-to-persist - enqueue a PENDING SUGGESTION, never a memory
 # ---------------------------------------------------------------------------
 
 
-def test_suggest_never_persists() -> None:
+def test_suggest_persists_suggestion_not_memory() -> None:
     store = tmp_store()
     _pin_store(store)
     out = json.loads(mcp.tool_memory_suggest(
         "constraint", "auth via AuthService", "All authentication must use AuthService"))
     check("suggest: ok flag true", out["ok"] is True, f"(got {out})")
-    check("suggest: candidate returned", isinstance(out.get("candidate"), dict),
-          f"(got {out})")
-    check("suggest: nothing persisted",
+    check("suggest: pending suggestion returned",
+          isinstance(out.get("suggestion"), dict)
+          and out["suggestion"]["state"] == "pending", f"(got {out})")
+    check("suggest: no MEMORY persisted",
           am.list_memories(store) == [], f"(got {am.list_memories(store)})")
-    check("suggest: no audit events written",
-          am.read_audit(store) == [], f"(got {am.read_audit(store)})")
+    sugs = am.list_suggestions(store)
+    check("suggest: exactly one suggestion enqueued", len(sugs) == 1,
+          f"(got {sugs})")
+    events = am.read_audit(store)
+    check("suggest: SUGGESTION_CREATED audited",
+          [e["event"] for e in events] == ["SUGGESTION_CREATED"],
+          f"(got {events})")
+    check("suggest: audit actor is agent", events[0]["actor"] == "agent",
+          f"(got {events[0]})")
 
 
-def test_suggest_forces_agent_provenance() -> None:
+def test_suggest_is_not_a_memory_record() -> None:
+    """A suggestion carries no trust/status: it is a candidate, not a memory
+    (the memory schema is untouched - T3 decision)."""
     store = tmp_store()
     _pin_store(store)
     out = json.loads(mcp.tool_memory_suggest(
         "constraint", "t", "content here"))
-    cand = out["candidate"]
-    check("suggest: provenance forced to agent", cand["provenance"] == "agent",
-          f"(got {cand.get('provenance')})")
-    check("suggest: trust starts untrusted", cand["trust"] == "untrusted",
-          f"(got {cand.get('trust')})")
+    sug = out["suggestion"]
+    check("suggest: provenance pinned to agent", sug["provenance"] == "agent",
+          f"(got {sug.get('provenance')})")
+    check("suggest: no trust field (not a memory)", "trust" not in sug,
+          f"(got {sorted(sug.keys())})")
+    check("suggest: no status field (not a memory)", "status" not in sug,
+          f"(got {sorted(sug.keys())})")
+    check("suggest: id space is sug_", sug["id"].startswith("sug_"),
+          f"(got {sug['id']})")
 
 
 def test_suggest_secret_rejected_not_persisted() -> None:
@@ -225,8 +241,13 @@ def test_suggest_secret_rejected_not_persisted() -> None:
     check("suggest: secret -> ok false", out["ok"] is False, f"(got {out})")
     check("suggest: secret reported", out["report"]["secret_detected"] is not None,
           f"(got {out})")
-    check("suggest: secret candidate not persisted", am.list_memories(store) == [],
+    check("suggest: secret suggestion NOT enqueued", am.list_suggestions(store) == [],
+          f"(got {am.list_suggestions(store)})")
+    check("suggest: secret memory NOT persisted", am.list_memories(store) == [],
           f"(got {am.list_memories(store)})")
+    check("suggest: secret rejection audited",
+          [e["event"] for e in am.read_audit(store)] == ["SUGGESTION_REJECTED"],
+          f"(got {am.read_audit(store)})")
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +394,13 @@ def test_server_surface_exactly_allowed_tools() -> None:
     check("surface: exactly ALLOWED_TOOLS registered",
           names == sorted(mcp.ALLOWED_TOOLS), f"(got {names})")
     forbidden = {"memory_delete", "memory_promote", "memory_supersede",
-                 "memory_import", "memory_purge", "memory_allow_secret"}
+                 "memory_import", "memory_purge", "memory_allow_secret",
+                 "suggestion_approve", "suggestion_reject"}
     check("surface: delete/promote/supersede/import NOT exposed",
           not (set(names) & forbidden), f"(got {names})")
+    check("surface: approve/reject NOT exposed (agent cannot approve itself)",
+          not (set(names) & {"suggestion_approve", "suggestion_reject"}),
+          f"(got {names})")
 
 
 def test_server_surface_has_no_secret_override_param() -> None:

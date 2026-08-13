@@ -589,6 +589,90 @@ def audit_status():
 
 
 # ==========================================================================
+# suggestions - T3 approve-to-persist review loop (human CLI side)
+# ==========================================================================
+
+def audit_suggestions():
+    p = Project()
+    p.init()
+    r = p.run("suggestions", "list")
+    ok("suggestions: empty list -> 0 results exit 0",
+       r.returncode == 0 and "0 results" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+
+    # Seed two pending suggestions exactly as the core writes them (the
+    # agent surface is MCP; the CLI owns the human review side).
+    sug_dir = p.store() / "suggestions"
+    sug_dir.mkdir(parents=True, exist_ok=True)
+    base = {
+        "format_version": 1, "type": "error", "title": "t",
+        "content": "c", "project": p.name, "provenance": "agent",
+        "severity": "normal", "tags": [], "paths": [],
+        "created_at": "2026-08-13T00:00:00Z", "state": "pending",
+        "approved_at": None, "approved_by": None,
+        "rejected_at": None, "rejected_by": None,
+    }
+    s1 = dict(base, id="sug_11111111-0000-0000-0000-000000000001",
+              title="refresh tokens", content="tokens were reusable")
+    s2 = dict(base, id="sug_11111111-0000-0000-0000-000000000002",
+              title="bad idea", content="should never become memory")
+    for s in (s1, s2):
+        (sug_dir / f"{s['id']}.json").write_text(
+            json.dumps(s, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    r = p.run("suggestions", "list")
+    ok("suggestions: pending listed with state",
+       r.returncode == 0 and "refresh tokens" in r.stdout
+       and "state=pending" in r.stdout, r.stdout)
+
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001")
+    ok("suggestions: approve without --trust -> exit 2", r.returncode == 2,
+       f"rc={r.returncode}")
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001",
+              "--trust", "system")
+    ok("suggestions: approve --trust system -> exit 2", r.returncode == 2,
+       f"rc={r.returncode}")
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001",
+              "--trust", "approved")
+    ok("suggestions: approve exit 0 + trust + memory id",
+       r.returncode == 0 and "trust=approved" in r.stdout and "mem_" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    m = re.search(r"memory (mem_[0-9a-f-]+)", r.stdout)
+    mem_id = m.group(1) if m else ""
+    r = p.run("recall", "refresh")
+    ok("suggestions: approved suggestion recalled", "RELEVANT CONTEXT" in r.stdout,
+       r.stdout)
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001",
+              "--trust", "verified")
+    ok("suggestions: double-approve -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode} err={r.stderr!r}")
+
+    r = p.run("suggestions", "reject", "sug_11111111-0000-0000-0000-000000000002", "--json")
+    parsed = json.loads(r.stdout)
+    ok("suggestions: reject --json -> rejected record",
+       r.returncode == 0 and parsed["state"] == "rejected", f"out={r.stdout!r}")
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000002",
+              "--trust", "verified")
+    ok("suggestions: approve after reject -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode}")
+    r = p.run("suggestions", "approve", "sug_none", "--trust", "verified")
+    ok("suggestions: missing id -> exit 1 clean message",
+       r.returncode == 1 and "no suggestion" in (r.stderr or ""),
+       f"rc={r.returncode} err={r.stderr!r}")
+
+    events = p.audit_events()
+    ok("suggestions: SUGGESTION_APPROVED + REJECTED audited",
+       events.count("SUGGESTION_APPROVED") == 1
+       and events.count("SUGGESTION_REJECTED") == 1, str(events))
+    ids = p.all_ids()
+    ok("suggestions: only the approved suggestion became memory",
+       len(ids) == 1 and mem_id in ids, str(ids))
+    st = json.loads(p.run("status", "--json").stdout)
+    ok("suggestions: status pending count 0 after review",
+       st["suggestions_pending"] == 0, json.dumps(st)[:200])
+
+
+# ==========================================================================
 # not-initialized across commands + project discovery + corrupt config
 # ==========================================================================
 
@@ -715,6 +799,7 @@ def main() -> int:
     audit_supersede()
     audit_delete()
     audit_status()
+    audit_suggestions()
     audit_discovery_errors()
     audit_json_errors_and_meta()
     cleanup_all()

@@ -1127,6 +1127,224 @@ def test_cli_error_paths() -> None:
 
 
 # --------------------------------------------------------------------------
+# T3 suggestions - approve-to-persist loop (v0.3 Tier 3, EVIDENCE-034)
+# A suggestion is a CANDIDATE, not a memory: no trust/status, no recall
+# participation, human-only approval, terminal reject/approve, audited.
+# --------------------------------------------------------------------------
+
+def test_t3_propose_creates_pending_suggestion_not_memory() -> None:
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "constraint", "auth via AuthService",
+                                "All auth must use AuthService",
+                                project="p", paths=["src/auth/**"])
+    check("t3: id space is sug_", sug["id"].startswith("sug_"), f"(got {sug['id']})")
+    check("t3: state pending", sug["state"] == "pending", f"(got {sug})")
+    check("t3: provenance pinned to agent", sug["provenance"] == "agent",
+          f"(got {sug.get('provenance')})")
+    check("t3: no trust field (not a memory)", "trust" not in sug,
+          f"(got {sorted(sug.keys())})")
+    check("t3: no status field (not a memory)", "status" not in sug,
+          f"(got {sorted(sug.keys())})")
+    check("t3: no MEMORY persisted", am.list_memories(store) == [],
+          f"(got {am.list_memories(store)})")
+    check("t3: suggestion file written to suggestions dir",
+          (store / am.SUGGESTION_SUBDIR / f"{sug['id']}.json").exists())
+    events = am.read_audit(store)
+    check("t3: SUGGESTION_CREATED audited",
+          [e["event"] for e in events] == ["SUGGESTION_CREATED"], f"(got {events})")
+    check("t3: audit actor agent", events[0]["actor"] == "agent", f"(got {events[0]})")
+
+
+def test_t3_propose_secret_rejected_before_write() -> None:
+    """The queue must not be a backdoor persistence mechanism: secrets are
+    rejected BEFORE any write - nothing is persisted and it is audited."""
+    store = tmp_store()
+    try:
+        am.propose_suggestion(store, "constraint", "token",
+                              "here is the key: " + "ghp_" + "a" * 36,
+                              project="p")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t3: secret proposal rejected", raised)
+    check("t3: no suggestion persisted", am.list_suggestions(store) == [],
+          f"(got {am.list_suggestions(store)})")
+    check("t3: no memory persisted", am.list_memories(store) == [],
+          f"(got {am.list_memories(store)})")
+    events = am.read_audit(store)
+    check("t3: SUGGESTION_REJECTED audited",
+          [e["event"] for e in events] == ["SUGGESTION_REJECTED"], f"(got {events})")
+    check("t3: rejection detail is secret_detected",
+          events[0]["detail"].get("reason") == "secret_detected", f"(got {events[0]})")
+
+
+def test_t3_approve_converts_to_memory_with_chosen_trust() -> None:
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "error", "token refresh bug",
+                                "tokens were reusable", project="p")
+    record = am.approve_suggestion(store, sug["id"], "approved")
+    check("t3: approve creates a memory", record["id"].startswith("mem_"),
+          f"(got {record['id']})")
+    check("t3: trust is the human-chosen level", record["trust"] == "approved",
+          f"(got {record['trust']})")
+    check("t3: memory provenance stays agent", record["provenance"] == "agent",
+          f"(got {record.get('provenance')})")
+    check("t3: suggestion now approved",
+          am.load_suggestion(store, sug["id"])["state"] == "approved")
+    check("t3: approved memory is recalled",
+          [r["title"] for r in am.recall_memories(store, "token refresh")]
+          == ["token refresh bug"], f"(got {am.recall_memories(store, 'token refresh')})")
+    events = am.read_audit(store)
+    approves = [e for e in events if e["event"] == "SUGGESTION_APPROVED"]
+    check("t3: SUGGESTION_APPROVED audited with memory_id + trust",
+          len(approves) == 1 and approves[0]["memory_id"] == record["id"]
+          and approves[0]["detail"]["trust"] == "approved", f"(got {approves})")
+
+
+def test_t3_approve_trust_ladder_governs() -> None:
+    """Approval != automatic max trust: the human picks verified or approved,
+    never 'system'; invalid trust is a usage error."""
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "lesson", "rule", "content", project="p")
+    record = am.approve_suggestion(store, sug["id"], "verified")
+    check("t3: verified chosen", record["trust"] == "verified", f"(got {record['trust']})")
+    sug2 = am.propose_suggestion(store, "lesson", "rule2", "content2", project="p")
+    try:
+        am.approve_suggestion(store, sug2["id"], "system")
+        raised = False
+    except am.UsageError:
+        raised = True
+    check("t3: approve --trust system rejected", raised)
+    check("t3: rejected-system suggestion still pending",
+          am.load_suggestion(store, sug2["id"])["state"] == "pending")
+
+
+def test_t3_approve_reject_terminal() -> None:
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "constraint", "t", "c", project="p")
+    am.approve_suggestion(store, sug["id"], "approved")
+    try:
+        am.approve_suggestion(store, sug["id"], "approved")
+        twice = False
+    except am.AgentMemoryError:
+        twice = True
+    check("t3: double-approve rejected (terminal)", twice)
+    sug2 = am.propose_suggestion(store, "constraint", "t2", "c2", project="p")
+    am.reject_suggestion(store, sug2["id"])
+    check("t3: reject marks state rejected",
+          am.load_suggestion(store, sug2["id"])["state"] == "rejected")
+    try:
+        am.approve_suggestion(store, sug2["id"], "approved")
+        after = False
+    except am.AgentMemoryError:
+        after = True
+    check("t3: approve after reject rejected (terminal)", after)
+    try:
+        am.reject_suggestion(store, sug2["id"])
+        rej2 = False
+    except am.AgentMemoryError:
+        rej2 = True
+    check("t3: double-reject rejected (terminal)", rej2)
+    check("t3: rejected suggestion created no memory",
+          am.list_memories(store) != [] and len(am.list_memories(store)) == 1,
+          f"(got {am.list_memories(store)})")
+    rejects = [e for e in am.read_audit(store) if e["event"] == "SUGGESTION_REJECTED"]
+    check("t3: SUGGESTION_REJECTED audited (human_review)",
+          len(rejects) == 1 and rejects[0]["detail"]["reason"] == "human_review",
+          f"(got {rejects})")
+
+
+def test_t3_approve_reruns_secret_scan() -> None:
+    """Defense against disk tampering: a proposal edited to contain a secret
+    after enqueue must never become memory."""
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "constraint", "t", "clean content",
+                                project="p")
+    path = store / am.SUGGESTION_SUBDIR / f"{sug['id']}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["content"] = "leak: " + "sk-" + "c" * 20
+    am._write_text_utf8(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    try:
+        am.approve_suggestion(store, sug["id"], "approved")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t3: tampered proposal refused at approval", raised)
+    check("t3: no memory created from tampered proposal",
+          am.list_memories(store) == [], f"(got {am.list_memories(store)})")
+
+
+def test_t3_list_filters_and_status() -> None:
+    store = tmp_store()
+    s1 = am.propose_suggestion(store, "constraint", "one", "c1", project="p")
+    s2 = am.propose_suggestion(store, "error", "two", "c2", project="p")
+    am.reject_suggestion(store, s2["id"])
+    all_ids = [s["id"] for s in am.list_suggestions(store)]
+    check("t3: list all returns both (created_at desc, id desc tie-break)",
+          len(all_ids) == 2 and set(all_ids) == {s1["id"], s2["id"]}
+          and all_ids == sorted(all_ids, reverse=True), f"(got {all_ids})")
+    check("t3: list state filter pending",
+          [s["id"] for s in am.list_suggestions(store, state="pending")] == [s1["id"]])
+    check("t3: list state filter rejected",
+          [s["id"] for s in am.list_suggestions(store, state="rejected")] == [s2["id"]])
+    try:
+        am.load_suggestion(store, "sug_00000000-0000-0000-0000-000000000000")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t3: missing suggestion id raises clean error", raised)
+    summary = am.status_summary(store)
+    check("t3: status reports pending suggestion count",
+          summary["suggestions_pending"] == 1, f"(got {summary})")
+
+
+def test_t3_cli_flow() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t3-cli-"))
+    _run_cli(tmp, "init", "--project", "demo")
+    r = _run_cli(tmp, "add", "--type", "constraint", "--title", "Existing",
+                 "--content", "already trusted context")
+    mem_id = r.stdout.strip().split()[-1]
+    _run_cli(tmp, "promote", mem_id, "--trust", "approved")
+    r = _run_cli(tmp, "suggestions", "list")
+    check("t3-cli: empty list prints 0 results exit 0",
+          r.returncode == 0 and "0 results" in r.stdout, f"(got {r.stdout!r})")
+    # Enqueue via the core (the agent surface is MCP; the CLI owns approval).
+    store = am.find_store(tmp)
+    sug = am.propose_suggestion(store, "error", "refresh tokens",
+                                "tokens were reusable", project="demo")
+    r = _run_cli(tmp, "suggestions", "list")
+    check("t3-cli: pending listed",
+          r.returncode == 0 and "refresh tokens" in r.stdout
+          and "state=pending" in r.stdout, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "suggestions", "approve", sug["id"])
+    check("t3-cli: approve without --trust exit 2", r.returncode == 2,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+    r = _run_cli(tmp, "suggestions", "approve", sug["id"], "--trust", "approved")
+    check("t3-cli: approve exit 0 + trust printed",
+          r.returncode == 0 and "trust=approved" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "recall", "refresh")
+    check("t3-cli: approved suggestion recalled", "RELEVANT CONTEXT" in r.stdout,
+          f"(got {r.stdout!r})")
+    # Reject path with --json.
+    sug2 = am.propose_suggestion(store, "error", "bad idea",
+                                 "should not become memory", project="demo")
+    r = _run_cli(tmp, "suggestions", "reject", sug2["id"], "--json")
+    data = json.loads(r.stdout)
+    check("t3-cli: reject --json returns rejected record",
+          r.returncode == 0 and data["state"] == "rejected", f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "suggestions", "approve", sug2["id"], "--trust", "verified")
+    check("t3-cli: approve after reject exit 1", r.returncode == 1,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+    r = _run_cli(tmp, "status", "--json")
+    data = json.loads(r.stdout)
+    check("t3-cli: status pending count 0", data["suggestions_pending"] == 0,
+          f"(got {data})")
+    r = _run_cli(tmp, "suggestions", "bogus")
+    check("t3-cli: bad action exit 2", r.returncode == 2, f"(rc={r.returncode})")
+
+
+# --------------------------------------------------------------------------
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

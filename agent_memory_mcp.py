@@ -19,19 +19,23 @@ The adapter NEVER bypasses the core security model. It never reads or writes
 memory files directly; every operation goes through the core pipeline
 (validation -> secret detection -> trust rules -> storage -> audit).
 
-Rules enforced here, never in the agent's control:
-  - Tool surface (exactly these 7): memory_recall, memory_search,
+Rules enforced here, never in the agent's control:    - Tool surface (exactly these 7): memory_recall, memory_search,
     memory_get, memory_history, memory_suggest, memory_create,
-    memory_validate.
+    memory_validate. (T3 approve/reject stay CLI-only - the agent can
+    propose, never approve.)
     NOT exposed to agent sessions: memory_delete, memory_promote, supersede,
     import, purge.
   - provenance is forced to "agent"; actor is forced to "agent" (the audit
     trail can tell agent actions from human CLI actions).
   - allow_secret is always False - an agent can never override secret
     detection.
-  - memory_suggest returns a VALIDATED CANDIDATE PREVIEW without persisting:
-    the AI proposes, persistence stays in the core, and promotion to trusted
-    remains human-only. The full approve-to-persist loop is T3.
+  - memory_suggest ENQUEUES a validated, secret-screened PENDING SUGGESTION
+    (T3 approve-to-persist loop, EVIDENCE-034): the AI proposes, a HUMAN
+    approves. A suggestion is not a memory - it never enters recall/trust/
+    lifecycle until approved. approval/rejection are CLI-only and never
+    exposed on this surface, so an agent can never approve its own
+    suggestion. memory_create remains a documented lower-level escape hatch
+    (agent-created untrusted memory, promoted by humans).
 
 The core module stays stdlib-only; `mcp` is an optional extra:
     pip install agent-memory[mcp]
@@ -235,28 +239,39 @@ def tool_memory_suggest(
     paths: list[str] | None = None,
     severity: str = "normal",
 ) -> str:
-    """Propose a memory: validated candidate preview, NOT persisted.
+    """Propose a memory: enqueue a validated, secret-screened PENDING
+    SUGGESTION (T3 approve-to-persist loop).
 
-    The AI proposes; the system decides. The returned record carries
-    provenance=agent and trust=untrusted. Persist it explicitly with
-    memory_create; promotion to trusted is human-only and never exposed here.
+    The AI proposes; the SYSTEM decides. A suggestion is NOT a memory: it
+    carries no trust/status, never enters recall or the memory lifecycle,
+    and only a human can convert it into a memory (CLI: `suggestions
+    approve <id> --trust verified|approved` - approval is never exposed on
+    this surface, so an agent cannot approve its own suggestion). Secrets
+    are rejected BEFORE the suggestion is written - rejected material
+    (including any secret content) never travels back out.
     """
     try:
         store = _resolve_store()
-        record = _candidate(store, mem_type, title, content, tags, paths, severity)
-        report = _check_candidate(store, record)
-        if not report["valid"]:
-            # The candidate is NOT echoed on failure: rejected material
-            # (including any secret content) never travels back out.
-            payload = {"ok": False, "error": "; ".join(report["errors"]) or
-                       f"secret detected: {report['secret_detected']}",
-                       "report": report}
-        else:
-            payload = {"ok": True, "candidate": record, "report": report,
-                       "note": "candidate only - not persisted; call "
-                               "memory_create to store, promotion is human-only"}
+        suggestion = am.propose_suggestion(
+            store, mem_type, title, content,
+            project=_project_name(store),
+            severity=severity, tags=tags, paths=paths,
+            actor="agent",
+        )
+        payload = {"ok": True, "suggestion": suggestion,
+                   "note": "pending suggestion - a human must approve it "
+                           "before it becomes memory (CLI: suggestions "
+                           "approve <id> --trust verified|approved); approval "
+                           "is never exposed to agents"}
     except (am.AgentMemoryError, am.UsageError, OSError, ValueError) as exc:
-        payload = {"ok": False, "error": str(exc)}
+        report = None
+        try:
+            store = _resolve_store()
+            record = _candidate(store, mem_type, title, content, tags, paths, severity)
+            report = _check_candidate(store, record)
+        except Exception:  # noqa: BLE001 - report is best-effort on failure
+            report = None
+        payload = {"ok": False, "error": str(exc), "report": report}
     except Exception as exc:  # noqa: BLE001 - protocol contract: never leak
         payload = {"ok": False,
                    "error": f"internal error: {type(exc).__name__}: {exc}"}

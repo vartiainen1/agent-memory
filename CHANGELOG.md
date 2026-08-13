@@ -5,6 +5,28 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 Tier 3, suggestions - approve-to-persist loop - EVIDENCE-034)
+- `memory_suggest` now ENQUEUES a validated, secret-screened pending
+  suggestion (`.agent/suggestions/sug_<uuid>.json`) instead of returning a
+  preview: the AI proposes, the SYSTEM decides. A suggestion is NOT a
+  memory - no trust/status fields, never enters recall/lifecycle until
+  approved.
+- New CLI review commands: `suggestions list [--state ...]`,
+  `suggestions approve <sug_id> --trust verified|approved`,
+  `suggestions reject <sug_id>`. Approval creates the memory through the
+  existing trust ladder (the human explicitly picks the trust level; never
+  `system`). Approve/reject are human-only and never exposed on the MCP
+  agent surface - an agent can never approve its own suggestion. Both are
+  TERMINAL and audited (SUGGESTION_CREATED/APPROVED/REJECTED).
+- Secrets are rejected BEFORE any suggestion is written (the queue is not
+  a backdoor persistence mechanism); approval re-screens the stored
+  proposal against disk tampering.
+- `memory_create` retained unchanged as a documented lower-level escape
+  hatch (agent-created untrusted memory, promoted by humans).
+- `status` now reports the pending-suggestion count.
+- +45 unit checks (302 total), +13 external-API audit checks (140),
+  +7 MCP checks (70); spec section 17 + README updated in the same
+  commit (drift-guard clean).
 ### Added (v0.3 Tier 2.1, path-aware ranking - EVIDENCE-031)
 - `--path` is now a TIERED ranking signal instead of a flat +10: exact
   file (10) > bare directory (6) > glob/prefix (3) > unrelated (0). A
