@@ -944,6 +944,93 @@ def test_path_matcher() -> None:
         check("path: char class rejected", True)
 
 
+def test_path_tier() -> None:
+    """v0.3 T2.1 (EVIDENCE-031): path_tier hierarchy - exact file (3) > bare
+    directory (2) > glob/prefix (1) > unrelated/neutral (0)."""
+    check("tier: exact file", am.path_tier("src/auth/login.py", "src/auth/login.py") == 3)
+    check("tier: bare directory routes files under it",
+          am.path_tier("src/auth", "src/auth/login.py") == 2)
+    check("tier: deep directory", am.path_tier("src/auth", "src/auth/deep/x.py") == 2)
+    check("tier: sibling prefix collision not directory",
+          am.path_tier("src/auth", "src/auth2/x.py") == 0)
+    check("tier: glob prefix match", am.path_tier("src/auth/**", "src/auth/login.py") == 1)
+    check("tier: loose ** glob", am.path_tier("src/**", "src/auth/x.py") == 1)
+    check("tier: bare ** is neutral", am.path_tier("**", "src/auth/x.py") == 0)
+    check("tier: unrelated no match", am.path_tier("src/other/**", "src/auth/x.py") == 0)
+    check("tier: unrelated bare dir", am.path_tier("src/other", "src/auth/x.py") == 0)
+    check("tier: empty pattern neutral", am.path_tier("", "src/a.py") == 0)
+    check("tier: empty path neutral", am.path_tier("src/a.py", "") == 0)
+
+
+def test_tier21_path_bonus_hierarchy() -> None:
+    """v0.3 T2.1 A4 (EVIDENCE-031): for equal text scores, exact file >
+    directory > glob > unrelated ordering when --path is given."""
+    store = tmp_store()
+    ids = {}
+    for kind, pats in [("exact", ["src/auth/login.py"]),
+                       ("dir", ["src/auth"]),
+                       ("glob", ["src/auth/**"]),
+                       ("none", [])]:
+        ids[kind] = am.create_memory(
+            store, "decision", f"auth {kind}", "auth policy",
+            project="p", paths=pats)["id"]
+    for mid in ids.values():
+        am.promote_trust(store, mid, "approved")
+    results = am.recall_memories(store, "auth", path="src/auth/login.py")
+    order = [r["title"] for r in results]
+    check("t2.1 A4: exact ranks above directory",
+          order.index("auth exact") < order.index("auth dir"), f"(got {order})")
+    check("t2.1 A4: directory ranks above glob",
+          order.index("auth dir") < order.index("auth glob"), f"(got {order})")
+    check("t2.1 A4: glob ranks above unrelated",
+          order.index("auth glob") < order.index("auth none"), f"(got {order})")
+
+
+def test_t21_path_text_still_matters() -> None:
+    """v0.3 T2.1 A5 (EVIDENCE-031): a strong text match without a path can
+    still outrank a weak-text exact-path match - path is a signal, not an
+    auto-win."""
+    store = tmp_store()
+    strong = am.create_memory(
+        store, "lesson", "postgresql transactional consistency engine",
+        "postgresql chosen for transactional consistency of financial data",
+        project="p", tags=[])["id"]
+    weak_exact = am.create_memory(
+        store, "decision", "x", "y", project="p",
+        paths=["src/db/main.py"])["id"]
+    for mid in (strong, weak_exact):
+        am.promote_trust(store, mid, "approved")
+    results = am.recall_memories(store, "postgresql transactional",
+                                 path="src/db/main.py")
+    titles = [r["title"] for r in results]
+    check("t2.1 A5: strong text outranks weak exact-path",
+          titles[0] == "postgresql transactional consistency engine",
+          f"(got {titles})")
+
+
+def test_t21_directory_scoping_recall() -> None:
+    """v0.3 T2.1 A6 (EVIDENCE-031): a bare directory pattern routes to files
+    under it via the CLI - previously it matched nothing useful."""
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t21-"))
+    _run_cli(tmp, "init")
+    m1 = _run_cli(tmp, "add", "--type", "constraint", "--title", "Auth dir rule",
+                  "--content", "all auth via AuthService", "--paths", "src/auth")
+    m2 = _run_cli(tmp, "add", "--type", "constraint", "--title", "Other area",
+                  "--content", "unrelated area", "--paths", "src/other")
+    check("t2.1 A6: two memories added", m1.returncode == 0 and m2.returncode == 0,
+          f"({m1.stderr} {m2.stderr})")
+    for line in (m1.stdout + m2.stdout).splitlines():
+        if "created mem_" in line:
+            mid = line.split()[-1]
+            r = _run_cli(tmp, "promote", mid, "--trust", "approved")
+            check("t2.1 A6: promote ok", r.returncode == 0, r.stderr)
+    r = _run_cli(tmp, "recall", "auth", "--path", "src/auth/login.py", "--json")
+    payload = json.loads(r.stdout)
+    titles = [x["title"] for x in payload.get("results", [])]
+    check("t2.1 A6: directory-routed memory first",
+          titles and titles[0] == "Auth dir rule", f"(got {titles})")
+
+
 # --------------------------------------------------------------------------
 # 9. CLI subprocess integration (real binary, output VALUES)
 # --------------------------------------------------------------------------

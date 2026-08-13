@@ -61,7 +61,11 @@ SEVERITIES = ("low", "normal", "high", "critical")
 
 DEFAULT_RECALL_LIMIT = 10
 DEFAULT_SEARCH_LIMIT = 50
-PATH_BONUS = 10
+# T2.1 path-relevance tiers (EVIDENCE-031, locked 2026-08-13): --path is a
+# ranking SIGNAL, not an auto-win. Hierarchy: exact file > directory >
+# glob/prefix > unrelated. Text relevance still matters - a strong text
+# match without a path can outrank a weak-text exact-path match (A5).
+PATH_TIER_BONUS = {3: 10.0, 2: 6.0, 1: 3.0}
 
 # Family import (V0.1_SPEC.md section 14, v0.2 Tier 2.3 - EVIDENCE-003/016).
 IMPORT_SOURCES = ("error-log", "decision-log", "lesson-log", "rule-log")
@@ -171,6 +175,34 @@ def path_matches(pattern: str, path: str) -> bool:
     if pattern == "**":
         return True
     return _match_segments(pattern.split("/"), path.split("/"))
+
+
+def path_tier(pattern: str, path: str) -> int:
+    """Path-relevance tier of a memory pattern against a file path (T2.1).
+
+    Returns 3 (exact file) / 2 (bare directory containing the path) /
+    1 (glob/prefix match) / 0 (unrelated or neutral). A bare '**' pattern
+    matches everything, so it carries no path specificity - treated as
+    neutral (0), same as a memory with no paths (EVIDENCE-031 A6: a bare
+    directory like 'src/auth' now routes to files under it; previously
+    path_matches required the full segment list, so directories matched
+    nothing useful).
+    """
+    pattern = pattern.replace("\\", "/").strip("/")
+    path = path.replace("\\", "/").strip("/")
+    if not path or not pattern or pattern == "**":
+        return 0
+    if pattern == path:
+        return 3  # exact file
+    if not any(ch in pattern for ch in "*?"):
+        # bare literal pattern: directory containing the path (prefix + '/')
+        # guards against sibling-prefix collisions (src/auth vs src/auth2).
+        if path.startswith(pattern + "/"):
+            return 2
+        return 0
+    if path_matches(pattern, path):
+        return 1  # glob/prefix
+    return 0
 
 
 def _match_segments(pat: list[str], parts: list[str]) -> bool:
@@ -653,22 +685,24 @@ def _field_score(text: str, terms: list[str], idf: dict[str, float]) -> float:
 def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
                   path: str | None = None,
                   floor_ratio: float | None = None) -> list[dict]:
-    """Deterministic relevance ranking shared by search and recall (Tier 1).
+    """Deterministic relevance ranking shared by search and recall.
 
     Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
-    a phrase bonus; +PATH_BONUS when --path matches. Scores round to 6
-    decimals for cross-platform-stable ordering; exact ties break on
-    (created_at, title, id) desc. Honest zero results: score <= 0 (no term
-    hits, no path match) is excluded - recall never invents context
-    (EVIDENCE-003).
+    a phrase bonus; + a TIERED path bonus when --path matches (T2.1,
+    EVIDENCE-031): exact file (10) > directory (6) > glob (3) > none (0).
+    The tier is a ranking signal, not an auto-win - text relevance still
+    matters (A5). Scores round to 6 decimals for cross-platform-stable
+    ordering; exact ties break on (created_at, title, id) desc. Honest zero
+    results: score <= 0 (no term hits, no path match) is excluded - recall
+    never invents context (EVIDENCE-003).
 
     floor_ratio (Tier 2.1, EVIDENCE-010/015): when set, a memory's TEXT score
     must be >= floor_ratio x the best text score in the candidate set, UNLESS
-    it matches --path (path = explicit operator/agent intent, always kept).
-    Relative, not absolute: self-calibrates with corpus size (idf scales with
-    ln N) and can never zero out a sparse-but-unique match (the top text
-    score always passes). Applied by recall only; search stays inclusive so
-    operators keep full visibility (EVIDENCE-007).
+    any path tier matches (path = explicit operator/agent intent, always
+    kept). Relative, not absolute: self-calibrates with corpus size (idf
+    scales with ln N) and can never zero out a sparse-but-unique match (the
+    top text score always passes). Applied by recall only; search stays
+    inclusive so operators keep full visibility (EVIDENCE-007).
     """
     entries = []
     for r in records:
@@ -677,22 +711,22 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
             3.0 * _field_score(r.get("title", ""), terms, idf)
             + 2.0 * _field_score(tags_text, terms, idf)
             + 1.0 * _field_score(r.get("content", ""), terms, idf), 6)
-        matched_path = False
+        path_bonus = 0.0
         if path:
             for pat in r.get("paths", []):
-                if path_matches(pat, path):
-                    matched_path = True
-                    break
-        entries.append((text, matched_path, r))
+                tier = path_tier(pat, path)
+                if tier:
+                    path_bonus = max(path_bonus, PATH_TIER_BONUS[tier])
+        entries.append((text, path_bonus, r))
     best = max((e[0] for e in entries), default=0.0)
     scored = []
-    for text, matched_path, r in entries:
-        if text <= 0 and not matched_path:
+    for text, path_bonus, r in entries:
+        if text <= 0 and path_bonus <= 0:
             continue  # honest zero: no term hits and no path match.
-        if (floor_ratio is not None and not matched_path and text > 0
+        if (floor_ratio is not None and path_bonus <= 0 and text > 0
                 and text < floor_ratio * best):
             continue  # weak tail below the relevance floor.
-        score = text + (PATH_BONUS if matched_path else 0.0)
+        score = text + path_bonus
         scored.append((round(score, 6), r))
     scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""),
                                   pair[1].get("title", ""),
@@ -739,7 +773,7 @@ def recall_memories(
     limit: int | None = None,
     include_untrusted: bool = False,
 ) -> list[dict]:
-    """Agent recall: active + trusted memories, deterministic scoring, path bonus."""
+    """Agent recall: active + trusted memories, deterministic scoring, tiered path bonus."""
     config = load_config(store)
     if limit is None:
         limit = config.get("recall_limit", DEFAULT_RECALL_LIMIT)
@@ -1190,7 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_recall = sub.add_parser("recall", help="agent context assembly")
     p_recall.add_argument("query", nargs="?", default="")
-    p_recall.add_argument("--path", help="file path for the path bonus")
+    p_recall.add_argument("--path", help="file path for the tiered path bonus")
     p_recall.add_argument("--limit", type=int, default=None)
     p_recall.add_argument("--include-untrusted", action="store_true")
     p_recall.add_argument("--json", action="store_true")

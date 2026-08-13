@@ -5,6 +5,13 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 Tier 2.1, path-aware ranking - EVIDENCE-031)
+- `--path` is now a TIERED ranking signal instead of a flat +10: exact
+  file (10) > bare directory (6) > glob/prefix (3) > unrelated (0). A
+  bare directory pattern (`src/auth`) now routes to files under it.
+  Text relevance still matters - path is a signal, not an auto-win.
+- New `path_tier()` pure function + 19 unit checks (257 total); spec
+  section 8 + README updated in the same commit (drift-guard clean).
 ### Added (v0.3 Tier 1, agent interface - MCP)
 - `agent_memory_mcp.py`: stdio MCP server (official MCP SDK, optional
   `[mcp]` extra; core stays stdlib-only). Tools: memory_recall,

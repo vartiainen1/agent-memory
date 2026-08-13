@@ -140,6 +140,14 @@ unless they match `--path` (explicit intent). `search` stays
 inclusive — operators see everything that matches; agents get only
 confident context.
 
+`--path` is a **tiered ranking signal**, not an auto-win (v0.3 T2.1): a
+memory whose path pattern covers the touched file gets a bonus by
+specificity — exact file (10) > bare directory (6) > glob/prefix (3) —
+so `src/auth/**` outranks a generally-relevant auth memory when editing
+`src/auth/session.py`, while a strong text match without a path can
+still outrank a weak-text exact-path match. A bare directory pattern
+(`src/auth`) now routes to files under it.
+
 ### Family import (cold-start)
 
 A brand-new project can adopt the family's accumulated knowledge instead of
@@ -254,7 +262,7 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (238 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (257 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
 python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (63 checks)
 ```
