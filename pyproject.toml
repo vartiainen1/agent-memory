@@ -23,15 +23,19 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]  # optional MCP adapter (v0.3 T1) - core stays stdlib-only
+
 [project.urls]
 Homepage = "https://github.com/vartiainen1/agent-memory"
 Repository = "https://github.com/vartiainen1/agent-memory"
 
 [project.scripts]
 agent-memory = "agent_memory:main"
+agent-memory-mcp = "agent_memory_mcp:main"
 
 [tool.setuptools]
-py-modules = ["agent_memory"]
+py-modules = ["agent_memory", "agent_memory_mcp"]
 
 [tool.setuptools_scm]
 fallback_version = "0.1.0"

@@ -42,7 +42,8 @@ problem agent-memory is built around.
 
 ## Install
 
-Requires Python >= 3.11. Zero runtime dependencies.
+Requires Python >= 3.11. Zero runtime dependencies for the core.
+The MCP agent interface (v0.3 Tier 1) is an optional extra.
 
 ```bash
 # from this repository (the current distribution path - not yet on PyPI)
@@ -52,6 +53,9 @@ pip install git+https://github.com/vartiainen1/agent-memory.git
 git clone https://github.com/vartiainen1/agent-memory.git
 cd agent-memory
 pip install .
+
+# optional: MCP (Model Context Protocol) agent interface
+pip install .[mcp]
 ```
 
 Verify:
@@ -219,16 +223,40 @@ decision-log ─┼──▶ agent-memory ──recall──▶ AI agent ──p
 provenance/fingerprint fields schema-ready but unpopulated, and seeding is
 manual via `add --provenance import`.)
 
+## Agent interface (MCP, v0.3 Tier 1)
+
+`agent-memory-mcp` is a stdio MCP server that exposes the memory system
+to AI coding agents through the official MCP SDK:
+
+- Tools: `memory_recall`, `memory_search`, `memory_get`, `memory_history`,
+  `memory_suggest`, `memory_create`, `memory_validate`
+- The tool surface IS the permission boundary: `delete` and `promote` are
+  never exposed to agents - promotion stays human-only, deletion stays
+  CLI-only
+- `memory_suggest` returns a validated candidate preview without
+  persisting (the AI proposes; the system decides what becomes
+  authoritative)
+- Every call goes through the core pipeline: validation, secret
+  detection (never overridable), trust rules, audit (actor = agent)
+
+```bash
+agent-memory-mcp            # stdio server
+agent-memory-mcp --list-tools
+agent-memory-mcp --version
+```
+
 ## Requirements
 
 - Python >= 3.11 (stdlib only — `tomllib`, `uuid`, `hashlib`, `re`)
-- No pip dependencies
+- No pip dependencies for the core; the optional `[mcp]` extra adds the
+  official MCP SDK for the agent interface
 
 ## Development
 
 ```bash
 python _test_agent_memory.py   # unit + CLI integration tests (238 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
+python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (63 checks)
 ```
 
 `_audit_cli.py` treats the CLI as an external API: every check runs the real

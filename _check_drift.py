@@ -61,17 +61,19 @@ def spec_command_table() -> list[str]:
 
 
 def main() -> int:
-    # 1. README counts vs actual suites
+    # 1. README counts vs actual suites (unit + external-API audit + MCP)
     unit_actual = suite_checks(HERE / "_test_agent_memory.py")
     audit_actual = suite_checks(HERE / "_audit_cli.py")
+    mcp_actual = suite_checks(HERE / "_test_mcp.py")
     readme = README.read_text(encoding="utf-8", errors="replace")
     stated = [int(n) for n in re.findall(r"\((\d+) checks\)", readme)]
     if not stated:
         guard("README test counts", False, "README states no test count - state them explicitly.")
     for n in stated:
-        if n not in (unit_actual, audit_actual):
+        if n not in (unit_actual, audit_actual, mcp_actual):
             guard("README test counts", False,
-                  f"README states {n} but the suites report unit={unit_actual} audit={audit_actual}")
+                  f"README states {n} but the suites report unit={unit_actual} "
+                  f"audit={audit_actual} mcp={mcp_actual}")
 
     # 2. SPEC constants vs implementation (code-form vs prose-form)
     code = CODE.read_text(encoding="utf-8")
@@ -104,6 +106,15 @@ def main() -> int:
     for cmd in implemented:
         guard(f"impl cmd: {cmd}", cmd in commands,
               f"command {cmd!r} is implemented but missing from the spec table")
+
+    # 3b. README MCP tool list matches the adapter's permission surface
+    mcp_code = (HERE / "agent_memory_mcp.py").read_text(encoding="utf-8")
+    m = re.search(r"ALLOWED_TOOLS = \((.*?)\)", mcp_code, re.S)
+    allowed_names = re.findall(r"`(memory_\w+)`", m.group(1)) if m else []
+    readme_text = README.read_text(encoding="utf-8")
+    for name in allowed_names:
+        guard(f"readme tool: {name}", f"`{name}`" in readme_text,
+              f"tool {name!r} is in ALLOWED_TOOLS but missing from README")
 
     # 4. Python >= 3.11 in pyproject
     try:

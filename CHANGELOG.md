@@ -5,6 +5,19 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 Tier 1, agent interface - MCP)
+- `agent_memory_mcp.py`: stdio MCP server (official MCP SDK, optional
+  `[mcp]` extra; core stays stdlib-only). Tools: memory_recall,
+  memory_search, memory_get, memory_history, memory_suggest,
+  memory_create, memory_validate.
+- Permission boundary enforced by the tool surface: delete/promote/
+  supersede/import are NOT exposed to agent sessions; provenance forced
+  to agent; secret detection never overridable; audit actor = agent.
+- `memory_suggest` returns a validated candidate preview (no
+  persistence) - the AI proposes, the system decides.
+- 63-check companion suite (incl. stdio round-trip over the real server);
+  `_check_drift.py` now validates the third suite's README count and
+  cross-checks the README tool list against ALLOWED_TOOLS.
 ### Added (v0.2 Tier 2.3, rule-log source - EVIDENCE-023)
 - `import --source rule-log`: the numbered RULES OF ENGAGEMENT (sections
   1-6 of agent-log-ai/rules.txt) as `constraint` memories - the T9
