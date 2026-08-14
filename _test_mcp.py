@@ -385,8 +385,14 @@ def test_store_absent_is_clean_error() -> None:
 
 def test_server_surface_exactly_allowed_tools() -> None:
     if not mcp.MCP_AVAILABLE:
+        # Symmetric check count with the available branch (EVIDENCE-043: the
+        # suite must report the SAME count with or without the optional mcp
+        # extra, or the drift-guard README-count invariant becomes
+        # environment-dependent).
         check("surface: skipped (mcp extra not installed)", True)
         check("surface: no forbidden tools (not testable without mcp)", True)
+        check("surface: approve/reject not testable without mcp", True)
+        check("surface: T4/T5 review tools not testable without mcp", True)
         return
     server = mcp.build_server()
     tools = asyncio.run(server.list_tools())

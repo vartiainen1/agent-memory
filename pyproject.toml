@@ -24,7 +24,10 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0"]  # optional MCP adapter (v0.3 T1) - core stays stdlib-only
+mcp = ["mcp>=1.0,<2.0"]  # optional MCP adapter (v0.3 T1) - core stays stdlib-only.
+# The adapter targets the FastMCP API from mcp 1.x (mcp.server.fastmcp);
+# mcp 2.0 removed it (EVIDENCE-043). Pin the 1.x line the adapter is built
+# and dogfooded against - the surface was verified over that wire.
 
 [project.urls]
 Homepage = "https://github.com/vartiainen1/agent-memory"
