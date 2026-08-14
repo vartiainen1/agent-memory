@@ -5,6 +5,28 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 Tier 5, git awareness - EVIDENCE-041)
+- Write-time git context capture: when a memory is created (CLI add, MCP
+  memory_create, approval conversion) or suggested, agent-memory MAY
+  capture a versioned snapshot (`.agent/gitcontext/<mem_id>.json`,
+  schema `git-context-v1`) via the real `git` CLI: repository identity,
+  current branch, HEAD commit (sha/author/timestamp), changed paths.
+  Fail-soft: any git failure yields NO snapshot and NO error - memory
+  operations continue unchanged.
+- New CLI review surface: `git context <mem_id>`, `git list`, and a
+  `git_contexts` count in `status`. Human-CLI only - the MCP surface
+  stays exactly 7 tools (no git tool, no git args).
+- Deterministic retrieval enrichment: `recall --branch B` and the
+  existing `--path` now apply a bounded bonus from STORED snapshots only
+  (changed-path overlap via path_tier tiers, branch equality). The bonus
+  reorders within the already-qualified set - it never expands recall
+  and never rescues weak text from the floor. Author/timestamp/commit
+  are evidence, never scored.
+- Suggestions capture git context at propose and carry it through
+  approval (the approved memory keeps the proposal's context).
+- +32 unit checks (379 total), +12 external-API audit checks (173),
+  MCP forbidden set extended; spec section 19 + README updated in the
+  same commit (drift-guard clean).
 ### Added (v0.3 Tier 4, possible-conflict detection - EVIDENCE-038/039)
 - New CLI `conflicts` review commands: `conflicts scan` (on-demand,
   deterministic possible-conflict detection over ACTIVE memories),

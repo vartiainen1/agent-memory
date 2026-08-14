@@ -912,6 +912,87 @@ def audit_json_errors_and_meta():
 
 
 # ==========================================================================
+# git - T5 write-time context + stored-snapshot recall enrichment (EVIDENCE-041)
+# ==========================================================================
+
+def audit_git():
+    """T5 (EVIDENCE-041): versioned sidecar capture in a real git repo,
+    CLI review surface, non-git fail-soft fallback, recall --branch."""
+    # -- non-git project: fail-soft, no gitcontext dir, no git commands ----
+    p = Project()
+    p.init()
+    p.add("decision", "plain memory", "no git here")
+    r = p.run("git", "list")
+    ok("git: non-git project git list -> 0 results exit 0",
+       r.returncode == 0 and "0 results" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    ok("git: non-git project no gitcontext dir",
+       not (p.store() / "gitcontext").exists())
+    r = p.run("status", "--json")
+    ok("git: non-git status git_contexts 0",
+       json.loads(r.stdout)["git_contexts"] == 0,
+       f"out={r.stdout!r}")
+
+    # -- real git repo: capture + review + recall -------------------------
+    q = Project()
+    # make q.dir a real git repo with one commit touching src/auth/login.py
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=str(q.dir), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=str(q.dir),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(q.dir),
+                       check=True, capture_output=True)
+        d = q.dir / "src" / "auth"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "login.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(q.dir), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "auth init"], cwd=str(q.dir),
+                       check=True, capture_output=True)
+        git_ok = True
+    except (subprocess.SubprocessError, OSError):
+        git_ok = False
+    if not git_ok:
+        ok("git: real-repo checks skipped (git unavailable)", True)
+        return
+
+    q.init()
+    q.add("decision", "auth gate", "all auth through the gate", "--paths", "src/auth/**")
+    r = q.run("list", "--json")
+    mem_id = json.loads(r.stdout)["results"][0]["id"]
+    q.run("promote", mem_id, "--trust", "verified")  # recall excludes untrusted
+    r = q.run("git", "context", mem_id, "--json")
+    ok("git: context exit 0 + versioned schema",
+       r.returncode == 0 and "git-context-v1" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    snap = json.loads(r.stdout)
+    ok("git: changed paths include the committed file",
+       "src/auth/login.py" in snap.get("changed_paths", []),
+       f"out={snap.get('changed_paths')}")
+    ok("git: branch captured", snap.get("branch") in ("master", "main"),
+       f"out={snap.get('branch')}")
+    r = q.run("git", "list")
+    ok("git: list shows the memory", mem_id in r.stdout, f"out={r.stdout!r}")
+    r = q.run("status")
+    ok("git: status reports 1 git context", "git contexts  : 1" in r.stdout,
+       f"out={r.stdout!r}")
+    # recall --branch: matches recall; other branch no exclusion (bonus only)
+    r = q.run("recall", "gate", "--branch", snap["branch"], "--json")
+    ok("git: recall --branch returns the memory",
+       r.returncode == 0 and json.loads(r.stdout)["count"] == 1,
+       f"out={r.stdout!r}")
+    r = q.run("recall", "gate", "--branch", "other", "--json")
+    ok("git: other branch no exclusion",
+       json.loads(r.stdout)["count"] == 1, f"out={r.stdout!r}")
+    # error paths
+    r = q.run("git", "context", "mem_nope")
+    ok("git: missing context exit 1", r.returncode == 1, f"rc={r.returncode}")
+    r = q.run("git", "context")
+    ok("git: context without id exit 2", r.returncode == 2, f"rc={r.returncode}")
+
+
+# ==========================================================================
 
 def main() -> int:
     print("=== agent-memory external-API audit (v0.1) ===")
@@ -926,6 +1007,7 @@ def main() -> int:
     audit_status()
     audit_suggestions()
     audit_conflicts()
+    audit_git()
     audit_discovery_errors()
     audit_json_errors_and_meta()
     cleanup_all()

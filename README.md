@@ -94,14 +94,15 @@ agent-memory recall "auth" --path src/auth/login.py
 | `list [--type T] [--status S] [--json]` | list memories |
 | `show <mem_id> [--json]` | show one memory |
 | `search QUERY [--type T] [--status S] [--limit N] [--json]` | operator textual search (limit 50) |
-| `recall QUERY [--path P] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only) |
+| `recall QUERY [--path P] [--branch B] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only; `--branch` uses the stored T5 git snapshot) |
 | `promote <mem_id> --trust verified\|approved` | human trust promotion (never `system`) |
 | `import PATH --source error-log\|decision-log\|lesson-log\|rule-log` | family import (untrusted, provenance-tracked, idempotent) |
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
 | `suggestions list \| approve <sug_id> --trust verified\|approved \| reject <sug_id>` | human review of agent suggestions (T3 approve-to-persist loop) |
 | `conflicts scan \| list \| dismiss <cf_id> \| resolve <cf_id> --old <id> --new <id>` | human review of possible-conflict pairs (T4 detection, EVIDENCE-038/039) |
-| `status [--json]` | store health + counts (incl. pending suggestions + open conflicts) |
+| `git context <mem_id> \| git list` | review stored T5 git snapshots (write-time context, EVIDENCE-041) |
+| `status [--json]` | store health + counts (incl. pending suggestions + open conflicts + git contexts) |
 
 Exit codes: `0` success · `1` runtime error · `2` usage error.
 Every command supports `--json` for machine-readable output.
@@ -242,9 +243,9 @@ to AI coding agents through the official MCP SDK:
 - Tools: `memory_recall`, `memory_search`, `memory_get`, `memory_history`,
   `memory_suggest`, `memory_create`, `memory_validate`
 - The tool surface IS the permission boundary: `delete`, `promote`,
-  `supersede`, `import`, and the T3/T4 review commands (`suggestions`,
-  `conflicts`) are never exposed to agents - promotion/approval stay
-  human-only (CLI), deletion stays CLI-only
+  `supersede`, `import`, and the T3/T4/T5 review commands (`suggestions`,
+  `conflicts`, `git context`/`git list`) are never exposed to agents -
+  promotion/approval stay human-only (CLI), deletion stays CLI-only
 - `memory_suggest` enqueues a validated, secret-screened **pending
   suggestion** (T3 approve-to-persist loop, EVIDENCE-034): the AI
   proposes, only a human converts it into a memory (`suggestions
@@ -272,8 +273,8 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (347 checks)
-python _audit_cli.py           # external-API audit, real binary via subprocess (161 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (379 checks)
+python _audit_cli.py           # external-API audit, real binary via subprocess (173 checks)
 python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (71 checks)
 ```
 

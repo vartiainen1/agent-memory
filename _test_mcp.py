@@ -397,7 +397,7 @@ def test_server_surface_exactly_allowed_tools() -> None:
                  "memory_import", "memory_purge", "memory_allow_secret",
                  "suggestion_approve", "suggestion_reject",
                  "conflict_scan", "conflict_dismiss", "conflict_resolve",
-                 "memory_conflicts"}
+                 "memory_conflicts", "git_context", "git_list"}
     check("surface: delete/promote/supersede/import NOT exposed",
           not (set(names) & forbidden), f"(got {names})")
     check("surface: approve/reject NOT exposed (agent cannot approve itself)",

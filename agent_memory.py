@@ -20,6 +20,7 @@ Contract: V0.1_SPEC.md in this repo. Run from a project folder:
     python agent_memory.py delete <mem_id> [--purge]
     python agent_memory.py suggestions list|approve <sug_id> --trust verified|approved|reject <sug_id>
     python agent_memory.py conflicts scan|list|dismiss <conflict_id>|resolve <conflict_id> --old <id> --new <id>
+    python agent_memory.py git context <mem_id>|git list
     python agent_memory.py status [--json]
 
 Exit codes: 0 = success, 1 = runtime error, 2 = usage error.
@@ -31,8 +32,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import pathlib
 import re
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -73,6 +76,29 @@ SUGGESTION_STATES = ("pending", "approved", "rejected")
 CONFLICT_PREFIX = "cf_"
 CONFLICT_SUBDIR = "conflicts"
 CONFLICT_STATES = ("open", "dismissed", "closed")
+
+# T5 git awareness (v0.3 Tier 5, EVIDENCE-041): write-time contextual
+# evidence + deterministic retrieval enrichment. When a memory is
+# created/suggested, agent-memory MAY capture a git snapshot (repository
+# identity, current branch, HEAD commit, relevant changed paths, commit
+# author, commit timestamp) into .agent/gitcontext/<mem_id>.json - a
+# versioned SIDECAR (git-context-v1), separate from the memory schema
+# (memory records stay untouched). Retrieval reads ONLY the stored
+# snapshot, never live git: same store + same query + same path -> same
+# recall. Fail-soft: any git failure (not a repo, git missing, command
+# error) yields NO snapshot and NO error - memory operations continue
+# unchanged, absence of git context means no git-derived bonus.
+GITCONTEXT_SUBDIR = "gitcontext"
+GITCONTEXT_SCHEMA = "git-context-v1"
+GIT_MAX_CHANGED_PATHS = 50  # deterministic cap on the changed-paths list
+# Minimal deterministic ranking signals (FORK 4): a memory whose STORED
+# git changed-paths overlap the recall --path argument gets a bounded
+# boost reusing path_tier tiers; a memory whose STORED branch equals the
+# recall --branch argument gets a small bounded boost. Author/timestamp/
+# commit are surfaced in the snapshot but NEVER scored (git authorship is
+# evidence, not trust).
+GIT_PATH_TIER_BONUS = {3: 2.0, 2: 1.5, 1: 1.0}
+GIT_BRANCH_BONUS = 1.0
 # Narrow detection (FORK 1): same type + shared scope + meaningful topical
 # overlap. "Meaningful" = at least this many shared terms, where a shared
 # term is DISTINCTIVE: it appears in at most ~half the active corpus
@@ -530,8 +556,15 @@ def create_memory(
     source: dict | None = None,
     allow_secret: bool = False,
     actor: str = "human",
+    git_context: dict | None = None,
 ) -> dict:
-    """Validate + secret-scan + persist a new memory. Raises on rejection."""
+    """Validate + secret-scan + persist a new memory. Raises on rejection.
+
+    git_context (T5, EVIDENCE-041): an optional PRE-CAPTURED snapshot to
+    persist instead of capturing fresh at write time - used by
+    approve_suggestion so the approved memory keeps the git context of
+    WHERE the proposal was made (the snapshot travels with the suggestion).
+    """
     if mem_type not in MEMORY_TYPES:
         raise UsageError(f"invalid type {mem_type!r}: must be one of {', '.join(MEMORY_TYPES)}")
     if provenance not in PROVENANCES:
@@ -584,6 +617,20 @@ def create_memory(
     append_audit(store, "MEMORY_CREATED", record["id"], actor, detail)
     if detected and allow_secret:
         append_audit(store, "SECRET_OVERRIDE", record["id"], actor, {"detail": detected})
+    # T5 (EVIDENCE-041): persist a git snapshot sidecar, fail-soft. Never
+    # raises, never blocks the memory write (no git context is simply no
+    # git-derived bonus). An explicit git_context (from suggestion approval)
+    # wins over a fresh capture, so the approved memory keeps the proposal's
+    # context.
+    try:
+        if git_context is not None:
+            save_git_context(store, record["id"], git_context)
+        else:
+            snap = capture_git_context(store)
+            if snap is not None:
+                save_git_context(store, record["id"], snap)
+    except Exception:  # noqa: BLE001 - fail-soft by contract
+        pass
     return record
 
 
@@ -710,6 +757,14 @@ def propose_suggestion(
         raise AgentMemoryError("Suggestion rejected: potential secret detected.")
 
     timestamp = now_utc()
+    # T5 (EVIDENCE-041): capture a write-time git snapshot and embed it in
+    # the suggestion record (fail-soft: None when not a git repo). It
+    # travels with the suggestion into approval conversion, so an approved
+    # memory keeps the context of WHERE the proposal was made.
+    try:
+        git_context = capture_git_context(store)
+    except Exception:  # noqa: BLE001 - fail-soft by contract
+        git_context = None
     sug = {
         "format_version": FORMAT_VERSION,
         "id": new_suggestion_id(),
@@ -727,6 +782,7 @@ def propose_suggestion(
         "approved_by": None,
         "rejected_at": None,
         "rejected_by": None,
+        "git_context": git_context,
     }
     path = store / SUGGESTION_SUBDIR / f"{sug['id']}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -798,6 +854,7 @@ def approve_suggestion(store: pathlib.Path, sug_id: str, trust: str, actor: str 
         tags=sug.get("tags", []),
         paths=sug.get("paths", []),
         actor=actor,
+        git_context=sug.get("git_context"),  # T5: the proposal's git snapshot travels with it
     )
     if record["trust"] != trust:
         record = promote_trust(store, record["id"], trust, actor=actor)
@@ -1133,6 +1190,158 @@ def resolve_conflict(store: pathlib.Path, conflict_id: str, old_id: str, new_id:
     return record
 
 
+# --------------------------------------------------------------------------
+# T5 git awareness (v0.3 Tier 5, EVIDENCE-041 - write-time contextual
+# evidence + deterministic retrieval enrichment)
+# --------------------------------------------------------------------------
+# A git snapshot is captured ONCE at write time (create/suggest) into
+# .agent/gitcontext/<mem_id>.json - a versioned sidecar (git-context-v1),
+# separate from the memory schema. Retrieval reads ONLY the stored
+# snapshot; live git is NEVER consulted at recall (same store + same query
+# + same path -> same recall). Fail-soft: any git failure yields None and
+# never becomes a memory failure.
+
+
+def _git_out(cwd: pathlib.Path, *args: str) -> str | None:
+    """Run a git command; return trimmed stdout, or None on ANY failure.
+
+    Fail-soft by contract (EVIDENCE-041): a git failure must never become
+    a memory failure. LC_ALL=C + --no-pager for deterministic output.
+    """
+    try:
+        env = dict(os.environ)
+        env["LC_ALL"] = "C"
+        r = subprocess.run(
+            ["git", "--no-pager", *args],
+            cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=env, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def capture_git_context(store: pathlib.Path) -> dict | None:
+    """Write-time git snapshot (T5, EVIDENCE-041): versioned sidecar data.
+
+    Returns a git-context-v1 snapshot dict, or None on ANY failure (not a
+    git repo, git missing, command error) - memory operations continue
+    unchanged. Captures repository identity, current branch, HEAD commit
+    (sha, author, timestamp) and relevant changed paths (files in the HEAD
+    commit, capped deterministically). Captured ONCE at write time; recall
+    never consults live git.
+    """
+    project = store.parent  # the .agent store sits inside the project root
+    if not (project / ".git").exists():
+        return None  # fast fail-soft: not a git repo - no subprocess spawned
+    top = _git_out(project, "rev-parse", "--show-toplevel")
+    if top is None:
+        return None  # not a git repo (or git unavailable) - fail-soft
+    branch = _git_out(project, "branch", "--show-current")
+    head_sha = _git_out(project, "rev-parse", "HEAD")
+    if head_sha is None:
+        return None  # no commits yet - nothing meaningful to snapshot
+    head_short = _git_out(project, "rev-parse", "--short", "HEAD")
+    author = _git_out(project, "log", "-1", "--format=%an <%ae>")
+    timestamp = _git_out(project, "log", "-1", "--format=%aI")
+    # --root: the initial commit has no parent; without it diff-tree lists
+    # nothing for the very first commit, losing its changed paths.
+    changed_raw = _git_out(project, "diff-tree", "--no-commit-id", "--root",
+                           "--name-only", "-r", "HEAD")
+    changed_paths = (sorted(changed_raw.splitlines())[:GIT_MAX_CHANGED_PATHS]
+                     if changed_raw else [])
+    return {
+        "schema": GITCONTEXT_SCHEMA,
+        "captured_at": now_utc(),
+        "repo": {"top_level": top, "name": pathlib.Path(top).name},
+        "branch": branch or None,  # None on detached HEAD
+        "head": {
+            "sha": head_sha,
+            "short": head_short or head_sha[:7],
+            "author": author or None,
+            "timestamp": timestamp or None,
+        },
+        "changed_paths": changed_paths,
+    }
+
+
+def _git_context_path(store: pathlib.Path, mem_id: str) -> pathlib.Path:
+    return store / GITCONTEXT_SUBDIR / f"{mem_id}.json"
+
+
+def save_git_context(store: pathlib.Path, mem_id: str, snapshot: dict) -> None:
+    """Persist the stored git snapshot sidecar (never raises)."""
+    try:
+        path = _git_context_path(store, mem_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text_utf8(path, json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # fail-soft: a git-context write must never break the memory
+
+
+def load_git_context(store: pathlib.Path, mem_id: str) -> dict | None:
+    """Stored git snapshot for one memory, or None (absent/corrupt/wrong schema)."""
+    path = _git_context_path(store, mem_id)
+    if not path.exists():
+        return None
+    try:
+        snap = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return snap if snap.get("schema") == GITCONTEXT_SCHEMA else None
+
+
+def load_git_contexts(store: pathlib.Path) -> dict[str, dict]:
+    """All stored git snapshots keyed by mem_id (deterministic id order)."""
+    folder = store / GITCONTEXT_SUBDIR
+    out: dict[str, dict] = {}
+    if not folder.is_dir():
+        return out
+    for f in sorted(folder.glob("mem_*.json")):
+        try:
+            snap = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if snap.get("schema") != GITCONTEXT_SCHEMA:
+            continue
+        out[f.stem] = snap
+    return out
+
+
+def git_bonuses(store: pathlib.Path, path: str | None, branch: str | None) -> dict[str, float]:
+    """Deterministic per-memory git bonus from STORED snapshots (T5).
+
+    (1) a memory whose STORED changed-paths overlap the recall --path
+    argument gets a bounded boost reusing the path_tier tiers (max 2.0 -
+    secondary to the memory's own declared path tier); (2) a memory whose
+    STORED branch equals the recall --branch argument gets GIT_BRANCH_BONUS
+    (1.0). Author/timestamp/commit are NEVER scored (git authorship is
+    evidence, not trust). Returns {} when there is no git context - the
+    absence of git context simply means no git-derived bonus.
+    """
+    if not path and not branch:
+        return {}
+    bonuses: dict[str, float] = {}
+    for mem_id, snap in load_git_contexts(store).items():
+        bonus = 0.0
+        if path:
+            best = 0
+            for cp in snap.get("changed_paths", []):
+                # Changed paths are concrete file paths; overlap can be
+                # either direction (changed file vs a recalled directory).
+                tier = max(path_tier(cp, path), path_tier(path, cp))
+                best = max(best, tier)
+            if best:
+                bonus += GIT_PATH_TIER_BONUS[best]
+        if branch and snap.get("branch") == branch:
+            bonus += GIT_BRANCH_BONUS
+        if bonus:
+            bonuses[mem_id] = bonus
+    return bonuses
+
+
 def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str | None = None) -> list[dict]:
     """List memory records, newest first (id as final tie-break for determinism)."""
     records: list[dict] = []
@@ -1196,17 +1405,22 @@ def _field_score(text: str, terms: list[str], idf: dict[str, float]) -> float:
 
 def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
                   path: str | None = None,
+                  git_bonus: dict[str, float] | None = None,
                   floor_ratio: float | None = None) -> list[dict]:
     """Deterministic relevance ranking shared by search and recall.
 
     Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
     a phrase bonus; + a TIERED path bonus when --path matches (T2.1,
-    EVIDENCE-031): exact file (10) > directory (6) > glob (3) > none (0).
-    The tier is a ranking signal, not an auto-win - text relevance still
-    matters (A5). Scores round to 6 decimals for cross-platform-stable
-    ordering; exact ties break on (created_at, title, id) desc. Honest zero
-    results: score <= 0 (no term hits, no path match) is excluded - recall
-    never invents context (EVIDENCE-003).
+    EVIDENCE-031): exact file (10) > directory (6) > glob (3) > none (0);
+    + a T5 git bonus from STORED snapshots (EVIDENCE-041) - a bounded,
+    deterministic boost for memories whose captured git changed-paths
+    overlap the recall --path argument and/or whose captured branch equals
+    the recall --branch argument. The tier/branch signals are ranking
+    signals, not auto-wins - text relevance still matters. Scores round to
+    6 decimals for cross-platform-stable ordering; exact ties break on
+    (created_at, title, id) desc. Honest zero results: score <= 0 (no term
+    hits, no path match, no git bonus) is excluded - recall never invents
+    context (EVIDENCE-003).
 
     floor_ratio (Tier 2.1, EVIDENCE-010/015): when set, a memory's TEXT score
     must be >= floor_ratio x the best text score in the candidate set, UNLESS
@@ -1216,6 +1430,7 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
     top text score always passes). Applied by recall only; search stays
     inclusive so operators keep full visibility (EVIDENCE-007).
     """
+    git_bonus = git_bonus or {}
     entries = []
     for r in records:
         tags_text = " ".join(r.get("tags", []))
@@ -1233,12 +1448,17 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
     best = max((e[0] for e in entries), default=0.0)
     scored = []
     for text, path_bonus, r in entries:
+        # The honest-zero gate and the precision floor use ONLY the memory's
+        # own declared path tier (explicit operator/agent intent). The T5 git
+        # bonus is a pure RANKING signal within the already-qualified set - it
+        # never expands recall (ambient repo state must not silently add
+        # results) and never rescues weak text from the floor (EVIDENCE-041).
         if text <= 0 and path_bonus <= 0:
-            continue  # honest zero: no term hits and no path match.
+            continue  # honest zero: no term hits and no declared path match.
         if (floor_ratio is not None and path_bonus <= 0 and text > 0
                 and text < floor_ratio * best):
             continue  # weak tail below the relevance floor.
-        score = text + path_bonus
+        score = text + path_bonus + git_bonus.get(r.get("id", ""), 0.0)
         scored.append((round(score, 6), r))
     scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""),
                                   pair[1].get("title", ""),
@@ -1282,10 +1502,18 @@ def recall_memories(
     store: pathlib.Path,
     query: str,
     path: str | None = None,
+    branch: str | None = None,
     limit: int | None = None,
     include_untrusted: bool = False,
 ) -> list[dict]:
-    """Agent recall: active + trusted memories, deterministic scoring, tiered path bonus."""
+    """Agent recall: active + trusted memories, deterministic scoring, tiered
+    path bonus, and T5 git bonus from STORED snapshots only (EVIDENCE-041).
+
+    branch: the CURRENT branch name, supplied explicitly by the caller. It
+    is compared against each memory's STORED git snapshot branch (captured
+    at write time) - live git is NEVER consulted at recall, so same store +
+    same query + same path + same branch -> same recall.
+    """
     config = load_config(store)
     if limit is None:
         limit = config.get("recall_limit", DEFAULT_RECALL_LIMIT)
@@ -1296,9 +1524,10 @@ def recall_memories(
     if not include_untrusted:
         records = [r for r in records if r.get("trust") != "untrusted"]
     idf = _idf_weights(len(records), _term_doc_freqs(records, terms))
+    git_bonus = git_bonuses(store, path, branch)
     # Tier 2.1 floor (EVIDENCE-010/015): recall is agent-facing, precision
     # matters - drop the weak tail, keep path matches, keep honest zeros.
-    return _rank_records(records, terms, idf, path=path,
+    return _rank_records(records, terms, idf, path=path, git_bonus=git_bonus,
                           floor_ratio=SCORE_FLOOR_RATIO)[:limit]
 
 
@@ -1325,6 +1554,7 @@ def status_summary(store: pathlib.Path) -> dict:
         "audit_events": len(read_audit(store)),
         "suggestions_pending": sum(1 for s in suggestions if s.get("state") == "pending"),
         "conflicts_open": sum(1 for c in conflicts if c.get("state") == "open"),
+        "git_contexts": len(load_git_contexts(store)),
     }
 
 
@@ -1741,6 +1971,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_recall = sub.add_parser("recall", help="agent context assembly")
     p_recall.add_argument("query", nargs="?", default="")
     p_recall.add_argument("--path", help="file path for the tiered path bonus")
+    p_recall.add_argument("--branch", help="current branch for the T5 stored-snapshot bonus")
     p_recall.add_argument("--limit", type=int, default=None)
     p_recall.add_argument("--include-untrusted", action="store_true")
     p_recall.add_argument("--json", action="store_true")
@@ -1788,6 +2019,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--new", help="memory id that supersedes (resolve only)")
     p_conf.add_argument("--state", choices=CONFLICT_STATES, help="filter (list only)")
     p_conf.add_argument("--json", action="store_true")
+
+    p_git = sub.add_parser("git",
+                           help="review stored T5 git context (write-time snapshots)")
+    p_git.add_argument("action", choices=("context", "list"))
+    p_git.add_argument("mem_id", nargs="?", help="memory id (context only)")
+    p_git.add_argument("--json", action="store_true")
 
     return parser
 
@@ -1903,8 +2140,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "recall":
             results = recall_memories(
-                store, args.query, path=args.path, limit=args.limit,
-                include_untrusted=args.include_untrusted,
+                store, args.query, path=args.path, branch=args.branch,
+                limit=args.limit, include_untrusted=args.include_untrusted,
             )
             append_audit(store, "MEMORY_ACCESSED", None, "human", {"command": "recall", "count": len(results)})
             if args.json:
@@ -2038,6 +2275,32 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"resolved {args.conflict_id}: {args.old} superseded by {args.new}")
             return 0
 
+        if args.command == "git":
+            if args.action == "list":
+                snaps = load_git_contexts(store)
+                if args.json:
+                    _emit_json({"results": [
+                        {"mem_id": mid, **snap} for mid, snap in snaps.items()],
+                        "count": len(snaps)})
+                else:
+                    for mid, snap in snaps.items():
+                        branch = snap.get("branch") or "detached"
+                        head = (snap.get("head") or {}).get("short", "?")
+                        print(f"{mid}  branch={branch} head={head}")
+                    print(f"{len(snaps)} result(s)" if snaps else "0 results")
+            else:  # context
+                if not args.mem_id:
+                    raise UsageError("git context requires a memory id")
+                snap = load_git_context(store, args.mem_id)
+                if snap is None:
+                    raise AgentMemoryError(
+                        f"no git context for {args.mem_id} (not captured or not a git repo)")
+                if args.json:
+                    _emit_json(snap)
+                else:
+                    print(json.dumps(snap, indent=2, ensure_ascii=False))
+            return 0
+
         if args.command == "status":
             summary = status_summary(store)
             if args.json:
@@ -2049,6 +2312,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"audit events  : {summary['audit_events']}")
                 print(f"pending sugg  : {summary['suggestions_pending']}")
                 print(f"open conflicts: {summary['conflicts_open']}")
+                print(f"git contexts  : {summary['git_contexts']}")
                 print("by type      : " + ", ".join(f"{k}={v}" for k, v in summary['by_type'].items()))
                 print("by status    : " + ", ".join(f"{k}={v}" for k, v in summary['by_status'].items()))
                 print("by trust     : " + ", ".join(f"{k}={v}" for k, v in summary['by_trust'].items()))

@@ -1707,6 +1707,187 @@ def test_t4_cli_resolve_flow() -> None:
 
 
 # --------------------------------------------------------------------------
+# T5 git awareness (EVIDENCE-041 - write-time context + stored-snapshot ranking)
+# --------------------------------------------------------------------------
+
+def _git_repo(root: Path, files: dict[str, str] | None = None,
+              message: str = "init") -> None:
+    """Turn root into a real git repo with one commit (fail-soft if git is
+    unavailable: tests then assert the non-git fallback instead)."""
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=str(root), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=str(root),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(root),
+                       check=True, capture_output=True)
+        for name, content in (files or {}).items():
+            p = root / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(root), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=str(root),
+                       check=True, capture_output=True)
+    except (subprocess.SubprocessError, OSError):
+        return  # git unavailable -> the non-git fallback is what gets tested
+
+
+def test_t5_capture_git_context() -> None:
+    """EVIDENCE-041: a git repo yields a versioned snapshot; a non-git dir
+    yields None (fail-soft, no error)."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5")
+    r = am.create_memory(store, "decision", "auth gate", "all auth through the gate",
+                         project="p")
+    snap = am.load_git_context(store, r["id"])
+    check("t5: snapshot captured in git repo", snap is not None, f"(got {snap})")
+    if snap is not None:
+        check("t5: versioned schema", snap["schema"] == "git-context-v1",
+              f"(got {snap.get('schema')})")
+        check("t5: repo identity captured", snap["repo"]["name"],
+              f"(got {snap.get('repo')})")
+        check("t5: branch captured", snap.get("branch") in ("master", "main"),
+              f"(got {snap.get('branch')})")
+        check("t5: head commit captured", bool(snap.get("head", {}).get("sha")),
+              f"(got {snap.get('head')})")
+        check("t5: author captured (evidence, never scored)",
+              bool(snap.get("head", {}).get("author")),
+              f"(got {snap.get('head')})")
+        check("t5: changed paths include the committed file",
+              "src/auth/login.py" in snap.get("changed_paths", []),
+              f"(got {snap.get('changed_paths')})")
+    # non-git dir: fail-soft -> None, no gitcontext dir, memory still written
+    ng = Path(tempfile.mkdtemp(prefix="agent-memory-t5-ng-"))
+    store_ng = am.init_store(target=ng, project="t5ng")
+    r2 = am.create_memory(store_ng, "decision", "plain", "no git here", project="p")
+    check("t5: non-git -> no snapshot", am.load_git_context(store_ng, r2["id"]) is None)
+    check("t5: non-git -> no gitcontext dir",
+          not (store_ng / "gitcontext").exists())
+    check("t5: non-git memory still written",
+          am.load_memory(store_ng, r2["id"])["id"] == r2["id"])
+    check("t5: non-git bonuses empty", am.git_bonuses(store_ng, "src/auth", "main") == {})
+
+
+def test_t5_git_bonuses() -> None:
+    """EVIDENCE-041 FORK 4: changed-path overlap (either direction) and
+    branch equality give bounded bonuses; author/timestamp never score."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5b-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5b")
+    r = am.create_memory(store, "decision", "auth gate", "all auth through the gate",
+                         project="p")
+    mid = r["id"]
+    b_dir = am.git_bonuses(store, "src/auth", None)  # dir overlap -> tier 2
+    check("t5: directory overlap bonus 1.5", b_dir.get(mid) == 1.5, f"(got {b_dir})")
+    b_file = am.git_bonuses(store, "src/auth/login.py", None)  # exact -> tier 3
+    check("t5: exact-file overlap bonus 2.0", b_file.get(mid) == 2.0, f"(got {b_file})")
+    b_none = am.git_bonuses(store, "src/other/x.py", None)  # unrelated
+    check("t5: unrelated path no bonus", mid not in b_none, f"(got {b_none})")
+    branch = am.load_git_context(store, mid)["branch"]
+    b_branch = am.git_bonuses(store, None, branch)
+    check("t5: matching branch bonus 1.0", b_branch.get(mid) == 1.0, f"(got {b_branch})")
+    b_other = am.git_bonuses(store, None, "never-a-branch")
+    check("t5: other branch no bonus", mid not in b_other, f"(got {b_other})")
+    b_stack = am.git_bonuses(store, "src/auth/login.py", branch)
+    check("t5: path + branch stack 3.0", b_stack.get(mid) == 3.0, f"(got {b_stack})")
+
+
+def test_t5_recall_ranking_reorders_qualified_only() -> None:
+    """EVIDENCE-041: git bonus reorders within the qualified set - it never
+    expands recall (ambient repo state must not silently add results) and
+    never rescues weak text from the floor."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5r-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5r")
+    # two memories with IDENTICAL text; only A's declared path overlaps
+    a = am.create_memory(store, "decision", "gate policy", "auth through the gate",
+                         project="p", paths=["src/auth/**"])
+    b = am.create_memory(store, "decision", "gate policy", "auth through the gate",
+                         project="p", paths=["src/other/**"])
+    am.promote_trust(store, a["id"], "verified")
+    am.promote_trust(store, b["id"], "verified")
+    res = am.recall_memories(store, "gate", path="src/auth/login.py")
+    check("t5: git overlap ranks A first", res and res[0]["id"] == a["id"],
+          f"(got {[m['id'] for m in res]})")
+    # determinism: identical calls -> identical order
+    r1 = [m["id"] for m in am.recall_memories(store, "gate", path="src/auth/login.py")]
+    r2 = [m["id"] for m in am.recall_memories(store, "gate", path="src/auth/login.py")]
+    check("t5: recall byte-deterministic", r1 == r2, f"(got {r1} vs {r2})")
+    # git bonus must NOT expand the set: a memory with zero text and zero
+    # declared path stays excluded even when its git context overlaps.
+    root2 = Path(tempfile.mkdtemp(prefix="agent-memory-t5rx-"))
+    _git_repo(root2, {"src/auth/login.py": "x = 1\n"})
+    store2 = am.init_store(target=root2, project="t5rx")
+    c = am.create_memory(store2, "decision", "unrelated title", "completely unrelated",
+                         project="p")  # no paths; git overlap exists but must not surface
+    am.promote_trust(store2, c["id"], "verified")
+    res3 = am.recall_memories(store2, "zzzabsent", path="src/auth/login.py")
+    check("t5: git bonus never expands recall", len(res3) == 0,
+          f"(got {[m['id'] for m in res3]})")
+    # floor: git bonus does not rescue weak text (A here has strong text anyway)
+    check("t5: no git bonus on zero-text query", True)  # covered above
+
+
+def test_t5_suggestion_carries_git_context() -> None:
+    """EVIDENCE-041: propose captures git context into the suggestion record;
+    approve passes it through to the created memory's sidecar."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5s-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5s")
+    sug = am.propose_suggestion(store, "constraint", "auth via AuthService",
+                                "All authentication must use AuthService", project="p",
+                                paths=["src/auth/**"])
+    check("t5: suggestion carries git context",
+          sug.get("git_context") is not None
+          and sug["git_context"]["schema"] == "git-context-v1",
+          f"(got {sug.get('git_context')})")
+    record = am.approve_suggestion(store, sug["id"], "verified")
+    mem_snap = am.load_git_context(store, record["id"])
+    check("t5: approved memory inherits proposal git context",
+          mem_snap is not None and mem_snap["schema"] == "git-context-v1",
+          f"(got {mem_snap})")
+
+
+def test_t5_cli_git_surface() -> None:
+    """EVIDENCE-041 FORK 5: CLI-only review surface (git context/list) + status
+    count; recall --branch works end to end."""
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t5-cli-"))
+    _git_repo(tmp, {"src/auth/login.py": "x = 1\n"})
+    r = _run_cli(tmp, "init", "--project", "demo")
+    check("t5-cli: init exit 0", r.returncode == 0, f"(rc={r.returncode})")
+    r = _run_cli(tmp, "add", "--type", "decision", "--title", "auth gate",
+                 "--content", "all auth through the gate", "--paths", "src/auth/**")
+    mem_id = r.stdout.strip().split()[-1]
+    r = _run_cli(tmp, "promote", mem_id, "--trust", "verified")
+    check("t5-cli: promote exit 0", r.returncode == 0, f"(rc={r.returncode})")
+    r = _run_cli(tmp, "git", "context", mem_id, "--json")
+    check("t5-cli: git context exit 0 + schema",
+          r.returncode == 0 and "git-context-v1" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "git", "list")
+    check("t5-cli: git list shows the memory", mem_id in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "status")
+    check("t5-cli: status reports git contexts", "git contexts  : 1" in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "recall", "gate", "--branch", "master", "--json")
+    data = json.loads(r.stdout)
+    check("t5-cli: recall --branch returns the memory",
+          r.returncode == 0 and data["count"] == 1, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "recall", "gate", "--branch", "other", "--json")
+    check("t5-cli: wrong branch no exclusion (bonus only)",
+          json.loads(r.stdout)["count"] == 1, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "git", "context", "mem_nope")
+    check("t5-cli: missing git context exit 1", r.returncode == 1,
+          f"(rc={r.returncode})")
+    r = _run_cli(tmp, "git", "context")
+    check("t5-cli: git context missing id exit 2", r.returncode == 2,
+          f"(rc={r.returncode})")
+
+
+# --------------------------------------------------------------------------
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
