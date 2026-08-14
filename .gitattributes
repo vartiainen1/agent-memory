@@ -1,0 +1,3 @@
+# Byte-determinism contract (drift guard 6): every .py is LF on every
+# platform, regardless of core.autocrlf.
+*.py text eol=lf

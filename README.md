@@ -18,7 +18,8 @@ memory, but the AI must not have unrestricted authority over memory.**
 - **Structured** — DECISION / ERROR / LESSON / CONSTRAINT / ARCHITECTURE / PATTERN
   memories with typed metadata (provenance, trust, severity, paths, tags).
 - **Trusted** — AI/imported knowledge starts `untrusted`; only a human can
-  promote trust. Agents can never promote themselves.
+  promote trust. Agents can propose memories via a suggestion queue but
+  can never promote or approve themselves.
 - **Auditable** — immutable history (supersede, never rewrite), append-only
   audit log, secrets rejected before storage.
 - **Agent- and model-agnostic** — a boring, deterministic CLI any agent can
@@ -42,7 +43,8 @@ problem agent-memory is built around.
 
 ## Install
 
-Requires Python >= 3.11. Zero runtime dependencies.
+Requires Python >= 3.11. Zero runtime dependencies for the core.
+The MCP agent interface (v0.3 Tier 1) is an optional extra.
 
 ```bash
 # from this repository (the current distribution path - not yet on PyPI)
@@ -52,6 +54,9 @@ pip install git+https://github.com/vartiainen1/agent-memory.git
 git clone https://github.com/vartiainen1/agent-memory.git
 cd agent-memory
 pip install .
+
+# optional: MCP (Model Context Protocol) agent interface
+pip install .[mcp]
 ```
 
 Verify:
@@ -89,12 +94,15 @@ agent-memory recall "auth" --path src/auth/login.py
 | `list [--type T] [--status S] [--json]` | list memories |
 | `show <mem_id> [--json]` | show one memory |
 | `search QUERY [--type T] [--status S] [--limit N] [--json]` | operator textual search (limit 50) |
-| `recall QUERY [--path P] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only) |
+| `recall QUERY [--path P] [--branch B] [--limit N] [--json]` | agent context assembly (limit 10, trusted + active only; `--branch` uses the stored T5 git snapshot) |
 | `promote <mem_id> --trust verified\|approved` | human trust promotion (never `system`) |
 | `import PATH --source error-log\|decision-log\|lesson-log\|rule-log` | family import (untrusted, provenance-tracked, idempotent) |
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
-| `status [--json]` | store health + counts |
+| `suggestions list \| approve <sug_id> --trust verified\|approved \| reject <sug_id>` | human review of agent suggestions (T3 approve-to-persist loop) |
+| `conflicts scan \| list \| dismiss <cf_id> \| resolve <cf_id> --old <id> --new <id>` | human review of possible-conflict pairs (T4 detection, EVIDENCE-038/039) |
+| `git context <mem_id> \| git list` | review stored T5 git snapshots (write-time context, EVIDENCE-041) |
+| `status [--json]` | store health + counts (incl. pending suggestions + open conflicts + git contexts) |
 
 Exit codes: `0` success · `1` runtime error · `2` usage error.
 Every command supports `--json` for machine-readable output.
@@ -135,6 +143,14 @@ results whose text score is below 25% of the best match are dropped,
 unless they match `--path` (explicit intent). `search` stays
 inclusive — operators see everything that matches; agents get only
 confident context.
+
+`--path` is a **tiered ranking signal**, not an auto-win (v0.3 T2.1): a
+memory whose path pattern covers the touched file gets a bonus by
+specificity — exact file (10) > bare directory (6) > glob/prefix (3) —
+so `src/auth/**` outranks a generally-relevant auth memory when editing
+`src/auth/session.py`, while a strong text match without a path can
+still outrank a weak-text exact-path match. A bare directory pattern
+(`src/auth`) now routes to files under it.
 
 ### Family import (cold-start)
 
@@ -219,16 +235,47 @@ decision-log ─┼──▶ agent-memory ──recall──▶ AI agent ──p
 provenance/fingerprint fields schema-ready but unpopulated, and seeding is
 manual via `add --provenance import`.)
 
+## Agent interface (MCP, v0.3 Tier 1)
+
+`agent-memory-mcp` is a stdio MCP server that exposes the memory system
+to AI coding agents through the official MCP SDK:
+
+- Tools: `memory_recall`, `memory_search`, `memory_get`, `memory_history`,
+  `memory_suggest`, `memory_create`, `memory_validate`
+- The tool surface IS the permission boundary: `delete`, `promote`,
+  `supersede`, `import`, and the T3/T4/T5 review commands (`suggestions`,
+  `conflicts`, `git context`/`git list`) are never exposed to agents -
+  promotion/approval stay human-only (CLI), deletion stays CLI-only
+- `memory_suggest` enqueues a validated, secret-screened **pending
+  suggestion** (T3 approve-to-persist loop, EVIDENCE-034): the AI
+  proposes, only a human converts it into a memory (`suggestions
+  approve <id> --trust verified|approved`). A suggestion is not a
+  memory - it carries no trust/status and never enters recall until
+  approved. An agent can never approve its own suggestion.
+- `memory_create` remains a documented lower-level escape hatch for
+  deliberate integrations: it persists an untrusted agent memory
+  directly, which a human must later promote before trusted use
+- Every call goes through the core pipeline: validation, secret
+  detection (never overridable), trust rules, audit (actor = agent)
+
+```bash
+agent-memory-mcp            # stdio server
+agent-memory-mcp --list-tools
+agent-memory-mcp --version
+```
+
 ## Requirements
 
 - Python >= 3.11 (stdlib only — `tomllib`, `uuid`, `hashlib`, `re`)
-- No pip dependencies
+- No pip dependencies for the core; the optional `[mcp]` extra adds the
+  official MCP SDK for the agent interface
 
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (238 checks)
-python _audit_cli.py           # external-API audit, real binary via subprocess (127 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (379 checks)
+python _audit_cli.py           # external-API audit, real binary via subprocess (173 checks)
+python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (71 checks)
 ```
 
 `_audit_cli.py` treats the CLI as an external API: every check runs the real

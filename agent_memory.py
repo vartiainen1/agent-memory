@@ -18,6 +18,9 @@ Contract: V0.1_SPEC.md in this repo. Run from a project folder:
     python agent_memory.py promote <mem_id> --trust verified|approved
     python agent_memory.py supersede <old_id> <new_id>
     python agent_memory.py delete <mem_id> [--purge]
+    python agent_memory.py suggestions list|approve <sug_id> --trust verified|approved|reject <sug_id>
+    python agent_memory.py conflicts scan|list|dismiss <conflict_id>|resolve <conflict_id> --old <id> --new <id>
+    python agent_memory.py git context <mem_id>|git list
     python agent_memory.py status [--json]
 
 Exit codes: 0 = success, 1 = runtime error, 2 = usage error.
@@ -29,8 +32,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import pathlib
 import re
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -53,6 +58,57 @@ MEMORY_SUBDIR = "memory"
 CONFIG_FILE = "config.toml"
 AUDIT_FILE = "audit.jsonl"
 
+# T3 suggestions (v0.3 Tier 3, EVIDENCE-034): a suggestion is NOT a memory.
+# It lives in .agent/suggestions/ (separate subdir, separate schema - no
+# trust/status), never participates in recall/trust/supersession/lifecycle,
+# and only a human can convert it into a real memory. No new memory status.
+SUGGESTION_PREFIX = "sug_"
+SUGGESTION_SUBDIR = "suggestions"
+SUGGESTION_STATES = ("pending", "approved", "rejected")
+
+# T4 possible-conflict detection (v0.3 Tier 4, EVIDENCE-038): a conflict
+# record is an OBSERVATION, not a memory and not an authority. It lives in
+# .agent/conflicts/ (separate subdir, separate id space cf_), carries an
+# explanation (WHY the pair was surfaced - shared scope, shared high-weight
+# terms, type, trust, age) and NEVER a winner/relationship field. Only a
+# human can dismiss (audited, terminal while memories are unchanged) or
+# resolve via the existing supersede() machinery. No MCP surface.
+CONFLICT_PREFIX = "cf_"
+CONFLICT_SUBDIR = "conflicts"
+CONFLICT_STATES = ("open", "dismissed", "closed")
+
+# T5 git awareness (v0.3 Tier 5, EVIDENCE-041): write-time contextual
+# evidence + deterministic retrieval enrichment. When a memory is
+# created/suggested, agent-memory MAY capture a git snapshot (repository
+# identity, current branch, HEAD commit, relevant changed paths, commit
+# author, commit timestamp) into .agent/gitcontext/<mem_id>.json - a
+# versioned SIDECAR (git-context-v1), separate from the memory schema
+# (memory records stay untouched). Retrieval reads ONLY the stored
+# snapshot, never live git: same store + same query + same path -> same
+# recall. Fail-soft: any git failure (not a repo, git missing, command
+# error) yields NO snapshot and NO error - memory operations continue
+# unchanged, absence of git context means no git-derived bonus.
+GITCONTEXT_SUBDIR = "gitcontext"
+GITCONTEXT_SCHEMA = "git-context-v1"
+GIT_MAX_CHANGED_PATHS = 50  # deterministic cap on the changed-paths list
+# Minimal deterministic ranking signals (FORK 4): a memory whose STORED
+# git changed-paths overlap the recall --path argument gets a bounded
+# boost reusing path_tier tiers; a memory whose STORED branch equals the
+# recall --branch argument gets a small bounded boost. Author/timestamp/
+# commit are surfaced in the snapshot but NEVER scored (git authorship is
+# evidence, not trust).
+GIT_PATH_TIER_BONUS = {3: 2.0, 2: 1.5, 1: 1.0}
+GIT_BRANCH_BONUS = 1.0
+# Narrow detection (FORK 1): same type + shared scope + meaningful topical
+# overlap. "Meaningful" = at least this many shared terms, where a shared
+# term is DISTINCTIVE: it appears in at most ~half the active corpus
+# (df <= ceil(n / 2), floored at 2). Corpus-relative and deterministic -
+# a term that appears in most memories carries no discrimination.
+CONFLICT_MIN_SHARED_TERMS = 2
+CONFLICT_MAX_DF_NUMER = 1
+CONFLICT_MAX_DF_DENOM = 2
+CONFLICT_TERM_MIN_LEN = 3
+
 MEMORY_TYPES = ("decision", "error", "lesson", "constraint", "architecture", "pattern")
 PROVENANCES = ("human", "agent", "import", "system", "external")
 TRUST_LEVELS = ("untrusted", "verified", "approved", "system")
@@ -61,7 +117,11 @@ SEVERITIES = ("low", "normal", "high", "critical")
 
 DEFAULT_RECALL_LIMIT = 10
 DEFAULT_SEARCH_LIMIT = 50
-PATH_BONUS = 10
+# T2.1 path-relevance tiers (EVIDENCE-031, locked 2026-08-13): --path is a
+# ranking SIGNAL, not an auto-win. Hierarchy: exact file > directory >
+# glob/prefix > unrelated. Text relevance still matters - a strong text
+# match without a path can outrank a weak-text exact-path match (A5).
+PATH_TIER_BONUS = {3: 10.0, 2: 6.0, 1: 3.0}
 
 # Family import (V0.1_SPEC.md section 14, v0.2 Tier 2.3 - EVIDENCE-003/016).
 IMPORT_SOURCES = ("error-log", "decision-log", "lesson-log", "rule-log")
@@ -133,6 +193,16 @@ def new_id() -> str:
     return MEMORY_PREFIX + str(uuid.uuid4())
 
 
+def new_suggestion_id() -> str:
+    """sug_<uuid4> (T3 - distinct id space from memories)."""
+    return SUGGESTION_PREFIX + str(uuid.uuid4())
+
+
+def new_conflict_id() -> str:
+    """cf_<uuid4> (T4 - distinct id space from memories and suggestions)."""
+    return CONFLICT_PREFIX + str(uuid.uuid4())
+
+
 def shannon_entropy(text: str) -> float:
     """Shannon entropy per byte over an 8-bit alphabet."""
     if not text:
@@ -171,6 +241,34 @@ def path_matches(pattern: str, path: str) -> bool:
     if pattern == "**":
         return True
     return _match_segments(pattern.split("/"), path.split("/"))
+
+
+def path_tier(pattern: str, path: str) -> int:
+    """Path-relevance tier of a memory pattern against a file path (T2.1).
+
+    Returns 3 (exact file) / 2 (bare directory containing the path) /
+    1 (glob/prefix match) / 0 (unrelated or neutral). A bare '**' pattern
+    matches everything, so it carries no path specificity - treated as
+    neutral (0), same as a memory with no paths (EVIDENCE-031 A6: a bare
+    directory like 'src/auth' now routes to files under it; previously
+    path_matches required the full segment list, so directories matched
+    nothing useful).
+    """
+    pattern = pattern.replace("\\", "/").strip("/")
+    path = path.replace("\\", "/").strip("/")
+    if not path or not pattern or pattern == "**":
+        return 0
+    if pattern == path:
+        return 3  # exact file
+    if not any(ch in pattern for ch in "*?"):
+        # bare literal pattern: directory containing the path (prefix + '/')
+        # guards against sibling-prefix collisions (src/auth vs src/auth2).
+        if path.startswith(pattern + "/"):
+            return 2
+        return 0
+    if path_matches(pattern, path):
+        return 1  # glob/prefix
+    return 0
 
 
 def _match_segments(pat: list[str], parts: list[str]) -> bool:
@@ -341,6 +439,8 @@ def init_store(target: pathlib.Path | None = None, project: str | None = None, f
         store.mkdir(parents=True, exist_ok=True)
     for t in MEMORY_TYPES:
         (store / MEMORY_SUBDIR / t).mkdir(parents=True, exist_ok=True)
+    (store / SUGGESTION_SUBDIR).mkdir(parents=True, exist_ok=True)
+    (store / CONFLICT_SUBDIR).mkdir(parents=True, exist_ok=True)
     project_name = project or root.name
     config = {"project": project_name, "recall_limit": DEFAULT_RECALL_LIMIT, "include_untrusted": False}
     _write_text_utf8(store / CONFIG_FILE, _dump_toml(config))
@@ -456,8 +556,15 @@ def create_memory(
     source: dict | None = None,
     allow_secret: bool = False,
     actor: str = "human",
+    git_context: dict | None = None,
 ) -> dict:
-    """Validate + secret-scan + persist a new memory. Raises on rejection."""
+    """Validate + secret-scan + persist a new memory. Raises on rejection.
+
+    git_context (T5, EVIDENCE-041): an optional PRE-CAPTURED snapshot to
+    persist instead of capturing fresh at write time - used by
+    approve_suggestion so the approved memory keeps the git context of
+    WHERE the proposal was made (the snapshot travels with the suggestion).
+    """
     if mem_type not in MEMORY_TYPES:
         raise UsageError(f"invalid type {mem_type!r}: must be one of {', '.join(MEMORY_TYPES)}")
     if provenance not in PROVENANCES:
@@ -510,6 +617,20 @@ def create_memory(
     append_audit(store, "MEMORY_CREATED", record["id"], actor, detail)
     if detected and allow_secret:
         append_audit(store, "SECRET_OVERRIDE", record["id"], actor, {"detail": detected})
+    # T5 (EVIDENCE-041): persist a git snapshot sidecar, fail-soft. Never
+    # raises, never blocks the memory write (no git context is simply no
+    # git-derived bonus). An explicit git_context (from suggestion approval)
+    # wins over a fresh capture, so the approved memory keeps the proposal's
+    # context.
+    try:
+        if git_context is not None:
+            save_git_context(store, record["id"], git_context)
+        else:
+            snap = capture_git_context(store)
+            if snap is not None:
+                save_git_context(store, record["id"], snap)
+    except Exception:  # noqa: BLE001 - fail-soft by contract
+        pass
     return record
 
 
@@ -589,6 +710,638 @@ def delete_memory(store: pathlib.Path, mem_id: str, purge: bool = False, actor: 
     return record
 
 
+# --------------------------------------------------------------------------
+# T3 suggestions (v0.3 Tier 3, EVIDENCE-034 - approve-to-persist loop)
+# --------------------------------------------------------------------------
+# A suggestion is a CANDIDATE proposed by an agent, not a memory: it carries
+# no trust/status, never participates in recall/trust ranking/supersession/
+# lifecycle/history until a HUMAN converts it into a real memory. The queue
+# must not become a backdoor persistence mechanism: propose validates +
+# secret-screens BEFORE writing, pins provenance to agent, never assigns
+# trust, and approval/rejection are human-only, audited, and TERMINAL.
+
+def propose_suggestion(
+    store: pathlib.Path,
+    mem_type: str,
+    title: str,
+    content: str,
+    project: str,
+    severity: str = "normal",
+    tags: list[str] | None = None,
+    paths: list[str] | None = None,
+    actor: str = "agent",
+) -> dict:
+    """Validate + secret-screen + enqueue a pending suggestion.
+
+    A suggestion is NOT a memory: it is written to .agent/suggestions/
+    sug_<uuid>.json with NO trust/status fields (the memory schema is
+    untouched). provenance is hard-pinned to 'agent' - only agents propose
+    suggestions. Secret material is rejected BEFORE any write (never
+    persisted) and audited as SUGGESTION_REJECTED. Raises on rejection.
+    """
+    if mem_type not in MEMORY_TYPES:
+        raise UsageError(f"invalid type {mem_type!r}: must be one of {', '.join(MEMORY_TYPES)}")
+    if severity not in SEVERITIES:
+        raise UsageError(f"invalid severity {severity!r}: must be one of {', '.join(SEVERITIES)}")
+    if not isinstance(title, str) or not title.strip():
+        raise UsageError("title must be a non-empty string")
+    if not isinstance(content, str) or not content.strip():
+        raise UsageError("content must be a non-empty string")
+    for p in (paths or []):
+        validate_path_pattern(p)
+
+    detected = detect_secret(title, content)
+    if detected:
+        append_audit(store, "SUGGESTION_REJECTED", None, actor,
+                     {"reason": "secret_detected", "detail": detected})
+        raise AgentMemoryError("Suggestion rejected: potential secret detected.")
+
+    timestamp = now_utc()
+    # T5 (EVIDENCE-041): capture a write-time git snapshot and embed it in
+    # the suggestion record (fail-soft: None when not a git repo). It
+    # travels with the suggestion into approval conversion, so an approved
+    # memory keeps the context of WHERE the proposal was made.
+    try:
+        git_context = capture_git_context(store)
+    except Exception:  # noqa: BLE001 - fail-soft by contract
+        git_context = None
+    sug = {
+        "format_version": FORMAT_VERSION,
+        "id": new_suggestion_id(),
+        "type": mem_type,
+        "title": title.strip(),
+        "content": content.strip(),
+        "project": project,
+        "provenance": "agent",  # pinned: only agents propose suggestions
+        "severity": severity,
+        "tags": tags or [],
+        "paths": paths or [],
+        "created_at": timestamp,
+        "state": "pending",
+        "approved_at": None,
+        "approved_by": None,
+        "rejected_at": None,
+        "rejected_by": None,
+        "git_context": git_context,
+    }
+    path = store / SUGGESTION_SUBDIR / f"{sug['id']}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_utf8(path, json.dumps(sug, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "SUGGESTION_CREATED", None, actor,
+                 {"suggestion_id": sug["id"]})
+    return sug
+
+
+def load_suggestion(store: pathlib.Path, sug_id: str) -> dict:
+    """Load one suggestion by id."""
+    path = store / SUGGESTION_SUBDIR / f"{sug_id}.json"
+    if not path.exists():
+        raise AgentMemoryError(f"no suggestion with id {sug_id}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise AgentMemoryError(f"corrupt suggestion file {path}: {exc}") from exc
+
+
+def list_suggestions(store: pathlib.Path, state: str | None = None) -> list[dict]:
+    """List suggestions, newest first (id as final tie-break for determinism)."""
+    folder = store / SUGGESTION_SUBDIR
+    suggestions: list[dict] = []
+    if folder.is_dir():
+        for f in folder.glob("*.json"):
+            try:
+                suggestions.append(json.loads(f.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
+                raise AgentMemoryError(f"corrupt suggestion file {f}")
+    if state:
+        suggestions = [s for s in suggestions if s.get("state") == state]
+    suggestions.sort(key=lambda s: (s.get("created_at", ""), s.get("id", "")),
+                     reverse=True)
+    return suggestions
+
+
+def approve_suggestion(store: pathlib.Path, sug_id: str, trust: str, actor: str = "human") -> dict:
+    """Human-only conversion of a pending suggestion into a real memory.
+
+    The human EXPLICITLY chooses the resulting trust level (verified or
+    approved - never 'system'); approval is NOT automatically max trust.
+    The created memory is born untrusted then promoted through the existing
+    trust ladder (promote_trust), so the trust-transition rules govern. The
+    stored proposal is re-validated and re-screened for secrets (defense
+    against disk tampering). Terminal: only pending suggestions can be
+    approved. Returns the created memory record.
+    """
+    if trust not in ("verified", "approved"):
+        raise UsageError("approve --trust must be 'verified' or 'approved' (never 'system')")
+    sug = load_suggestion(store, sug_id)
+    if sug.get("state") != "pending":
+        raise AgentMemoryError(
+            f"cannot approve {sug_id}: state is {sug.get('state')}; only pending suggestions can be approved"
+        )
+    detected = detect_secret(sug.get("title", ""), sug.get("content", ""))
+    if detected:
+        raise AgentMemoryError(
+            f"refusing to approve {sug_id}: secret detected in the stored proposal"
+        )
+    record = create_memory(
+        store=store,
+        mem_type=sug["type"],
+        title=sug["title"],
+        content=sug["content"],
+        project=sug.get("project", store.parent.name),
+        provenance="agent",  # the knowledge originated from the agent proposal
+        severity=sug.get("severity", "normal"),
+        tags=sug.get("tags", []),
+        paths=sug.get("paths", []),
+        actor=actor,
+        git_context=sug.get("git_context"),  # T5: the proposal's git snapshot travels with it
+    )
+    if record["trust"] != trust:
+        record = promote_trust(store, record["id"], trust, actor=actor)
+    timestamp = now_utc()
+    sug["state"] = "approved"
+    sug["approved_at"] = timestamp
+    sug["approved_by"] = actor
+    _write_text_utf8(store / SUGGESTION_SUBDIR / f"{sug_id}.json",
+                     json.dumps(sug, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "SUGGESTION_APPROVED", record["id"], actor,
+                 {"suggestion_id": sug_id, "trust": trust})
+    return record
+
+
+def reject_suggestion(store: pathlib.Path, sug_id: str, actor: str = "human") -> dict:
+    """Human-only terminal rejection: discards the proposal, audited."""
+    sug = load_suggestion(store, sug_id)
+    if sug.get("state") != "pending":
+        raise AgentMemoryError(
+            f"cannot reject {sug_id}: state is {sug.get('state')}; only pending suggestions can be rejected"
+        )
+    timestamp = now_utc()
+    sug["state"] = "rejected"
+    sug["rejected_at"] = timestamp
+    sug["rejected_by"] = actor
+    _write_text_utf8(store / SUGGESTION_SUBDIR / f"{sug_id}.json",
+                     json.dumps(sug, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "SUGGESTION_REJECTED", None, actor,
+                 {"suggestion_id": sug_id, "reason": "human_review"})
+    return sug
+
+
+# --------------------------------------------------------------------------
+# T4 possible-conflict detection (v0.3 Tier 4, EVIDENCE-038)
+# --------------------------------------------------------------------------
+# A conflict record is an OBSERVATION, not an authority: it surfaces pairs
+# that deserve human attention (same type + shared scope + meaningful
+# topical overlap). It never decides a winner, never writes memory records,
+# and only a human can dismiss it (audited, terminal while memories are
+# unchanged) or resolve it via the existing supersede() machinery. Scan is
+# on-demand and deterministic; there is NO write-time enforcement.
+
+
+def _conflict_term_set(record: dict) -> set[str]:
+    """Lowercased tokens (len >= 3) from title + tags + content, for IDF."""
+    blob = " ".join((
+        record.get("title", ""),
+        " ".join(record.get("tags", [])),
+        record.get("content", ""),
+    )).lower()
+    return {t for t in re.split(r"[^a-z0-9]+", blob) if len(t) >= CONFLICT_TERM_MIN_LEN}
+
+
+def _paths_share_scope(a: list[str], b: list[str]) -> bool:
+    """True if any pattern in a matches any pattern in b (either direction)."""
+    for pa in a:
+        for pb in b:
+            if path_tier(pa, pb) > 0 or path_tier(pb, pa) > 0:
+                return True
+    return False
+
+
+def _tags_share_scope(a: list[str], b: list[str]) -> bool:
+    return bool(set(a) & set(b))
+
+
+def _conflict_explanation(a: dict, b: dict,
+                          shared_terms: list[str], idf: dict[str, float]) -> dict:
+    """Deterministic WHY record - explanation only, never a verdict.
+
+    EVIDENCE-038 FORK 2: NO winner field, NO relationship field - the
+    detector cannot establish either. Trust and age explain the candidate;
+    they never decide which memory (if either) is correct.
+    """
+    shared_paths = [p for p in a.get("paths", []) if any(
+        path_tier(p, q) > 0 or path_tier(q, p) > 0 for q in b.get("paths", []))]
+    shared_tags = sorted(set(a.get("tags", [])) & set(b.get("tags", [])))
+    return {
+        "shared_scope_paths": shared_paths,
+        "shared_tags": shared_tags,
+        "shared_high_weight_terms": sorted(shared_terms),
+        "overlap_score": round(sum(idf[t] for t in shared_terms), 6),
+        "same_type": a["type"],
+        "trust_a": a["trust"],
+        "trust_b": b["trust"],
+        "age_a": a["created_at"],
+        "age_b": b["created_at"],
+        "reason": "overlapping scope + topical similarity",
+    }
+
+
+def scan_conflicts(store: pathlib.Path, actor: str = "human") -> dict:
+    """On-demand deterministic scan: find pairs that deserve human review.
+
+    Returns a report dict (never writes memory records). For each new
+    candidate pair it writes one .agent/conflicts/cf_<uuid>.json record and
+    audits CONFLICT_DETECTED. Narrow (EVIDENCE-038 FORK 1): same type +
+    shared scope (path pattern overlap OR shared tag) + meaningful topical
+    overlap (>= CONFLICT_MIN_SHARED_TERMS terms with idf >=
+    CONFLICT_IDF_FLOOR). Ineligible: already supersession-linked, identical
+    ids, or previously dismissed AND both memories unchanged. Dismissed
+    pairs whose underlying memories have changed are re-eligible (a
+    conflict is an observation, not an authority - lifecycle rule).
+    Deterministic: pair iteration in (id) order, stable scoring, stable
+    output ordering.
+    """
+    folder = store / CONFLICT_SUBDIR
+    folder.mkdir(parents=True, exist_ok=True)
+    active = [r for r in list_memories(store) if r.get("status") == "active"]
+    active.sort(key=lambda r: r["id"])
+    existing = _load_conflicts(store)
+    open_pairs: set[tuple[str, str]] = set()
+    dismissed_unchanged: set[tuple[str, str]] = set()
+    state_closed: list[dict] = []
+    for rec in existing:
+        pair = tuple(sorted((rec["memory_a"], rec["memory_b"])))
+        if rec.get("state") != "open":
+            if rec.get("state") == "dismissed":
+                try:
+                    a = load_memory(store, rec["memory_a"])
+                    b = load_memory(store, rec["memory_b"])
+                except AgentMemoryError:
+                    continue  # a memory was purged; observation is stale, re-eligible
+                snap = rec.get("dismissed_snapshot", {})
+                if (a.get("updated_at") == snap.get("memory_a_updated_at")
+                        and b.get("updated_at") == snap.get("memory_b_updated_at")):
+                    dismissed_unchanged.add(pair)
+            continue
+        # Open record: re-establish the CURRENT state - close the observation
+        # if the pair is now supersession-linked or either memory is no longer
+        # active (deleted/purged). A conflict is an observation, not authority.
+        try:
+            a = load_memory(store, rec["memory_a"])
+            b = load_memory(store, rec["memory_b"])
+        except AgentMemoryError:
+            state_closed.append((rec, "memory_removed"))
+            continue
+        if a.get("status") != "active" or b.get("status") != "active":
+            state_closed.append((rec, "memory_no_longer_active"))
+            continue
+        if _supersession_linked(a, b):
+            state_closed.append((rec, "pair_superseded"))
+            continue
+        open_pairs.add(pair)
+    for rec, reason in state_closed:
+        rec["state"] = "closed"
+        rec["closed_at"] = now_utc()
+        rec["closed_by"] = actor
+        rec["closed_reason"] = reason
+        _write_text_utf8(store / CONFLICT_SUBDIR / f"{rec['id']}.json",
+                         json.dumps(rec, indent=2, ensure_ascii=False) + "\n")
+        append_audit(store, "CONFLICT_CLOSED", None, actor, {
+            "conflict_id": rec["id"],
+            "memory_a": rec["memory_a"],
+            "memory_b": rec["memory_b"],
+            "reason": reason,
+        })
+
+    all_terms = _all_terms(active)
+    df = _term_doc_freqs(active, all_terms)
+    idf = _idf_weights(len(active), df)
+    max_df = max(2, (len(active) * CONFLICT_MAX_DF_NUMER + CONFLICT_MAX_DF_DENOM - 1)
+                 // CONFLICT_MAX_DF_DENOM)
+    created: list[dict] = []
+    for i in range(len(active)):
+        for j in range(i + 1, len(active)):
+            a, b = active[i], active[j]
+            pair = (a["id"], b["id"])
+            if pair in open_pairs or pair in dismissed_unchanged:
+                continue
+            if _supersession_linked(a, b):
+                continue
+            if a["type"] != b["type"]:
+                continue  # narrow: same type required (FORK 1)
+            if not (_paths_share_scope(a.get("paths", []), b.get("paths", []))
+                    or _tags_share_scope(a.get("tags", []), b.get("tags", []))):
+                continue  # narrow: shared scope required
+            terms_a = _conflict_term_set(a)
+            terms_b = _conflict_term_set(b)
+            shared = [t for t in all_terms if t in terms_a and t in terms_b
+                      and df[t] <= max_df]
+            if len(shared) < CONFLICT_MIN_SHARED_TERMS:
+                continue  # narrow: meaningful topical overlap required
+            record = {
+                "format_version": FORMAT_VERSION,
+                "id": new_conflict_id(),
+                "state": "open",
+                "memory_a": a["id"],
+                "memory_b": b["id"],
+                "created_at": now_utc(),
+                "dismissed_at": None,
+                "dismissed_by": None,
+                "dismissed_snapshot": None,
+                "closed_at": None,
+                "closed_by": None,
+                "closed_reason": None,
+                "explanation": _conflict_explanation(a, b, shared, idf),
+            }
+            _write_text_utf8(folder / f"{record['id']}.json",
+                             json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+            append_audit(store, "CONFLICT_DETECTED", None, actor, {
+                "conflict_id": record["id"],
+                "memory_a": a["id"],
+                "memory_b": b["id"],
+                "type": a["type"],
+            })
+            created.append(record)
+    created.sort(key=lambda r: (r["created_at"], r["id"]))
+    return {
+        "scanned": len(active),
+        "candidates": len(created),
+        "already_open": len(open_pairs),
+        "dismissed_unchanged": len(dismissed_unchanged),
+        "closed_stale": len(state_closed),
+        "results": created,
+    }
+
+
+def _all_terms(records: list[dict]) -> list[str]:
+    """Deterministic sorted union of all memory term sets (df denominator)."""
+    terms: set[str] = set()
+    for r in records:
+        terms |= _conflict_term_set(r)
+    return sorted(terms)
+
+
+def _supersession_linked(a: dict, b: dict) -> bool:
+    return (a.get("supersedes") == b.get("id") or b.get("supersedes") == a.get("id")
+            or a.get("superseded_by") == b.get("id") or b.get("superseded_by") == a.get("id"))
+
+
+def _load_conflicts(store: pathlib.Path) -> list[dict]:
+    """All conflict records, sorted by (created_at, id) for determinism."""
+    folder = store / CONFLICT_SUBDIR
+    records: list[dict] = []
+    if folder.is_dir():
+        for f in folder.glob("*.json"):
+            try:
+                records.append(json.loads(f.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError) as exc:
+                raise AgentMemoryError(f"corrupt conflict file {f}: {exc}") from exc
+    records.sort(key=lambda r: (r.get("created_at", ""), r.get("id", "")))
+    return records
+
+
+def list_conflicts(store: pathlib.Path, state: str | None = None) -> list[dict]:
+    """List conflict records, newest first (state filter optional)."""
+    records = _load_conflicts(store)
+    if state:
+        records = [r for r in records if r.get("state") == state]
+    return list(reversed(records))
+
+
+def load_conflict(store: pathlib.Path, conflict_id: str) -> dict:
+    """Load one conflict record by id."""
+    path = store / CONFLICT_SUBDIR / f"{conflict_id}.json"
+    if not path.exists():
+        raise AgentMemoryError(f"no conflict record with id {conflict_id}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise AgentMemoryError(f"corrupt conflict file {path}: {exc}") from exc
+
+
+def dismiss_conflict(store: pathlib.Path, conflict_id: str, actor: str = "human") -> dict:
+    """Human-only, audited dismissal of an open conflict observation.
+
+    Terminal for the pair while the underlying memories are unchanged: the
+    record snapshots both memories' updated_at, and a later scan will not
+    re-flag a dismissed pair unless either memory changed (EVIDENCE-038
+    lifecycle rule - a conflict is an observation, not an authority).
+    """
+    record = load_conflict(store, conflict_id)
+    if record.get("state") != "open":
+        raise AgentMemoryError(
+            f"cannot dismiss {conflict_id}: state is {record.get('state')}; only open conflicts can be dismissed"
+        )
+    a = load_memory(store, record["memory_a"])
+    b = load_memory(store, record["memory_b"])
+    timestamp = now_utc()
+    record["state"] = "dismissed"
+    record["dismissed_at"] = timestamp
+    record["dismissed_by"] = actor
+    record["dismissed_snapshot"] = {
+        "memory_a_updated_at": a.get("updated_at"),
+        "memory_b_updated_at": b.get("updated_at"),
+    }
+    _write_text_utf8(store / CONFLICT_SUBDIR / f"{conflict_id}.json",
+                     json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "CONFLICT_DISMISSED", None, actor, {
+        "conflict_id": conflict_id,
+        "memory_a": a["id"],
+        "memory_b": b["id"],
+    })
+    return record
+
+
+def resolve_conflict(store: pathlib.Path, conflict_id: str, old_id: str, new_id: str,
+                     actor: str = "human") -> dict:
+    """Human-only resolution: supersede old by new via the existing
+    supersede() machinery, then close the observation (audited).
+
+    EVIDENCE-038 AC7: resolution MUST call the existing supersede() - same
+    guards (no chains, only active, bidirectional links). The conflict
+    record is closed with closed_reason='superseded' and audited as
+    CONFLICT_RESOLVED. Never invents a new relationship mechanism.
+    """
+    record = load_conflict(store, conflict_id)
+    if record.get("state") != "open":
+        raise AgentMemoryError(
+            f"cannot resolve {conflict_id}: state is {record.get('state')}; only open conflicts can be resolved"
+        )
+    # The conflict must reference the pair being superseded.
+    pair = {record.get("memory_a"), record.get("memory_b")}
+    if pair != {old_id, new_id}:
+        raise AgentMemoryError(
+            f"conflict {conflict_id} references {record.get('memory_a')}/{record.get('memory_b')}, "
+            f"not {old_id}/{new_id}; resolve the correct pair"
+        )
+    supersede(store, old_id, new_id, actor=actor)  # existing machinery + guards
+    timestamp = now_utc()
+    record["state"] = "closed"
+    record["closed_at"] = timestamp
+    record["closed_by"] = actor
+    record["closed_reason"] = "superseded"
+    _write_text_utf8(store / CONFLICT_SUBDIR / f"{conflict_id}.json",
+                     json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "CONFLICT_RESOLVED", old_id, actor, {
+        "conflict_id": conflict_id,
+        "new_id": new_id,
+        "reason": "superseded",
+    })
+    return record
+
+
+# --------------------------------------------------------------------------
+# T5 git awareness (v0.3 Tier 5, EVIDENCE-041 - write-time contextual
+# evidence + deterministic retrieval enrichment)
+# --------------------------------------------------------------------------
+# A git snapshot is captured ONCE at write time (create/suggest) into
+# .agent/gitcontext/<mem_id>.json - a versioned sidecar (git-context-v1),
+# separate from the memory schema. Retrieval reads ONLY the stored
+# snapshot; live git is NEVER consulted at recall (same store + same query
+# + same path -> same recall). Fail-soft: any git failure yields None and
+# never becomes a memory failure.
+
+
+def _git_out(cwd: pathlib.Path, *args: str) -> str | None:
+    """Run a git command; return trimmed stdout, or None on ANY failure.
+
+    Fail-soft by contract (EVIDENCE-041): a git failure must never become
+    a memory failure. LC_ALL=C + --no-pager for deterministic output.
+    """
+    try:
+        env = dict(os.environ)
+        env["LC_ALL"] = "C"
+        r = subprocess.run(
+            ["git", "--no-pager", *args],
+            cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=env, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def capture_git_context(store: pathlib.Path) -> dict | None:
+    """Write-time git snapshot (T5, EVIDENCE-041): versioned sidecar data.
+
+    Returns a git-context-v1 snapshot dict, or None on ANY failure (not a
+    git repo, git missing, command error) - memory operations continue
+    unchanged. Captures repository identity, current branch, HEAD commit
+    (sha, author, timestamp) and relevant changed paths (files in the HEAD
+    commit, capped deterministically). Captured ONCE at write time; recall
+    never consults live git.
+    """
+    project = store.parent  # the .agent store sits inside the project root
+    if not (project / ".git").exists():
+        return None  # fast fail-soft: not a git repo - no subprocess spawned
+    top = _git_out(project, "rev-parse", "--show-toplevel")
+    if top is None:
+        return None  # not a git repo (or git unavailable) - fail-soft
+    branch = _git_out(project, "branch", "--show-current")
+    head_sha = _git_out(project, "rev-parse", "HEAD")
+    if head_sha is None:
+        return None  # no commits yet - nothing meaningful to snapshot
+    head_short = _git_out(project, "rev-parse", "--short", "HEAD")
+    author = _git_out(project, "log", "-1", "--format=%an <%ae>")
+    timestamp = _git_out(project, "log", "-1", "--format=%aI")
+    # --root: the initial commit has no parent; without it diff-tree lists
+    # nothing for the very first commit, losing its changed paths.
+    changed_raw = _git_out(project, "diff-tree", "--no-commit-id", "--root",
+                           "--name-only", "-r", "HEAD")
+    changed_paths = (sorted(changed_raw.splitlines())[:GIT_MAX_CHANGED_PATHS]
+                     if changed_raw else [])
+    return {
+        "schema": GITCONTEXT_SCHEMA,
+        "captured_at": now_utc(),
+        "repo": {"top_level": top, "name": pathlib.Path(top).name},
+        "branch": branch or None,  # None on detached HEAD
+        "head": {
+            "sha": head_sha,
+            "short": head_short or head_sha[:7],
+            "author": author or None,
+            "timestamp": timestamp or None,
+        },
+        "changed_paths": changed_paths,
+    }
+
+
+def _git_context_path(store: pathlib.Path, mem_id: str) -> pathlib.Path:
+    return store / GITCONTEXT_SUBDIR / f"{mem_id}.json"
+
+
+def save_git_context(store: pathlib.Path, mem_id: str, snapshot: dict) -> None:
+    """Persist the stored git snapshot sidecar (never raises)."""
+    try:
+        path = _git_context_path(store, mem_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text_utf8(path, json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # fail-soft: a git-context write must never break the memory
+
+
+def load_git_context(store: pathlib.Path, mem_id: str) -> dict | None:
+    """Stored git snapshot for one memory, or None (absent/corrupt/wrong schema)."""
+    path = _git_context_path(store, mem_id)
+    if not path.exists():
+        return None
+    try:
+        snap = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return snap if snap.get("schema") == GITCONTEXT_SCHEMA else None
+
+
+def load_git_contexts(store: pathlib.Path) -> dict[str, dict]:
+    """All stored git snapshots keyed by mem_id (deterministic id order)."""
+    folder = store / GITCONTEXT_SUBDIR
+    out: dict[str, dict] = {}
+    if not folder.is_dir():
+        return out
+    for f in sorted(folder.glob("mem_*.json")):
+        try:
+            snap = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if snap.get("schema") != GITCONTEXT_SCHEMA:
+            continue
+        out[f.stem] = snap
+    return out
+
+
+def git_bonuses(store: pathlib.Path, path: str | None, branch: str | None) -> dict[str, float]:
+    """Deterministic per-memory git bonus from STORED snapshots (T5).
+
+    (1) a memory whose STORED changed-paths overlap the recall --path
+    argument gets a bounded boost reusing the path_tier tiers (max 2.0 -
+    secondary to the memory's own declared path tier); (2) a memory whose
+    STORED branch equals the recall --branch argument gets GIT_BRANCH_BONUS
+    (1.0). Author/timestamp/commit are NEVER scored (git authorship is
+    evidence, not trust). Returns {} when there is no git context - the
+    absence of git context simply means no git-derived bonus.
+    """
+    if not path and not branch:
+        return {}
+    bonuses: dict[str, float] = {}
+    for mem_id, snap in load_git_contexts(store).items():
+        bonus = 0.0
+        if path:
+            best = 0
+            for cp in snap.get("changed_paths", []):
+                # Changed paths are concrete file paths; overlap can be
+                # either direction (changed file vs a recalled directory).
+                tier = max(path_tier(cp, path), path_tier(path, cp))
+                best = max(best, tier)
+            if best:
+                bonus += GIT_PATH_TIER_BONUS[best]
+        if branch and snap.get("branch") == branch:
+            bonus += GIT_BRANCH_BONUS
+        if bonus:
+            bonuses[mem_id] = bonus
+    return bonuses
+
+
 def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str | None = None) -> list[dict]:
     """List memory records, newest first (id as final tie-break for determinism)."""
     records: list[dict] = []
@@ -652,24 +1405,32 @@ def _field_score(text: str, terms: list[str], idf: dict[str, float]) -> float:
 
 def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
                   path: str | None = None,
+                  git_bonus: dict[str, float] | None = None,
                   floor_ratio: float | None = None) -> list[dict]:
-    """Deterministic relevance ranking shared by search and recall (Tier 1).
+    """Deterministic relevance ranking shared by search and recall.
 
     Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
-    a phrase bonus; +PATH_BONUS when --path matches. Scores round to 6
-    decimals for cross-platform-stable ordering; exact ties break on
+    a phrase bonus; + a TIERED path bonus when --path matches (T2.1,
+    EVIDENCE-031): exact file (10) > directory (6) > glob (3) > none (0);
+    + a T5 git bonus from STORED snapshots (EVIDENCE-041) - a bounded,
+    deterministic boost for memories whose captured git changed-paths
+    overlap the recall --path argument and/or whose captured branch equals
+    the recall --branch argument. The tier/branch signals are ranking
+    signals, not auto-wins - text relevance still matters. Scores round to
+    6 decimals for cross-platform-stable ordering; exact ties break on
     (created_at, title, id) desc. Honest zero results: score <= 0 (no term
-    hits, no path match) is excluded - recall never invents context
-    (EVIDENCE-003).
+    hits, no path match, no git bonus) is excluded - recall never invents
+    context (EVIDENCE-003).
 
     floor_ratio (Tier 2.1, EVIDENCE-010/015): when set, a memory's TEXT score
     must be >= floor_ratio x the best text score in the candidate set, UNLESS
-    it matches --path (path = explicit operator/agent intent, always kept).
-    Relative, not absolute: self-calibrates with corpus size (idf scales with
-    ln N) and can never zero out a sparse-but-unique match (the top text
-    score always passes). Applied by recall only; search stays inclusive so
-    operators keep full visibility (EVIDENCE-007).
+    any path tier matches (path = explicit operator/agent intent, always
+    kept). Relative, not absolute: self-calibrates with corpus size (idf
+    scales with ln N) and can never zero out a sparse-but-unique match (the
+    top text score always passes). Applied by recall only; search stays
+    inclusive so operators keep full visibility (EVIDENCE-007).
     """
+    git_bonus = git_bonus or {}
     entries = []
     for r in records:
         tags_text = " ".join(r.get("tags", []))
@@ -677,22 +1438,27 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
             3.0 * _field_score(r.get("title", ""), terms, idf)
             + 2.0 * _field_score(tags_text, terms, idf)
             + 1.0 * _field_score(r.get("content", ""), terms, idf), 6)
-        matched_path = False
+        path_bonus = 0.0
         if path:
             for pat in r.get("paths", []):
-                if path_matches(pat, path):
-                    matched_path = True
-                    break
-        entries.append((text, matched_path, r))
+                tier = path_tier(pat, path)
+                if tier:
+                    path_bonus = max(path_bonus, PATH_TIER_BONUS[tier])
+        entries.append((text, path_bonus, r))
     best = max((e[0] for e in entries), default=0.0)
     scored = []
-    for text, matched_path, r in entries:
-        if text <= 0 and not matched_path:
-            continue  # honest zero: no term hits and no path match.
-        if (floor_ratio is not None and not matched_path and text > 0
+    for text, path_bonus, r in entries:
+        # The honest-zero gate and the precision floor use ONLY the memory's
+        # own declared path tier (explicit operator/agent intent). The T5 git
+        # bonus is a pure RANKING signal within the already-qualified set - it
+        # never expands recall (ambient repo state must not silently add
+        # results) and never rescues weak text from the floor (EVIDENCE-041).
+        if text <= 0 and path_bonus <= 0:
+            continue  # honest zero: no term hits and no declared path match.
+        if (floor_ratio is not None and path_bonus <= 0 and text > 0
                 and text < floor_ratio * best):
             continue  # weak tail below the relevance floor.
-        score = text + (PATH_BONUS if matched_path else 0.0)
+        score = text + path_bonus + git_bonus.get(r.get("id", ""), 0.0)
         scored.append((round(score, 6), r))
     scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""),
                                   pair[1].get("title", ""),
@@ -736,10 +1502,18 @@ def recall_memories(
     store: pathlib.Path,
     query: str,
     path: str | None = None,
+    branch: str | None = None,
     limit: int | None = None,
     include_untrusted: bool = False,
 ) -> list[dict]:
-    """Agent recall: active + trusted memories, deterministic scoring, path bonus."""
+    """Agent recall: active + trusted memories, deterministic scoring, tiered
+    path bonus, and T5 git bonus from STORED snapshots only (EVIDENCE-041).
+
+    branch: the CURRENT branch name, supplied explicitly by the caller. It
+    is compared against each memory's STORED git snapshot branch (captured
+    at write time) - live git is NEVER consulted at recall, so same store +
+    same query + same path + same branch -> same recall.
+    """
     config = load_config(store)
     if limit is None:
         limit = config.get("recall_limit", DEFAULT_RECALL_LIMIT)
@@ -750,9 +1524,10 @@ def recall_memories(
     if not include_untrusted:
         records = [r for r in records if r.get("trust") != "untrusted"]
     idf = _idf_weights(len(records), _term_doc_freqs(records, terms))
+    git_bonus = git_bonuses(store, path, branch)
     # Tier 2.1 floor (EVIDENCE-010/015): recall is agent-facing, precision
     # matters - drop the weak tail, keep path matches, keep honest zeros.
-    return _rank_records(records, terms, idf, path=path,
+    return _rank_records(records, terms, idf, path=path, git_bonus=git_bonus,
                           floor_ratio=SCORE_FLOOR_RATIO)[:limit]
 
 
@@ -767,6 +1542,8 @@ def status_summary(store: pathlib.Path) -> dict:
         by_status[r.get("status", "?")] = by_status.get(r.get("status", "?"), 0) + 1
         by_trust[r.get("trust", "?")] = by_trust.get(r.get("trust", "?"), 0) + 1
     config = load_config(store)
+    suggestions = list_suggestions(store)
+    conflicts = list_conflicts(store)
     return {
         "project": config.get("project", store.parent.name),
         "store": str(store),
@@ -775,6 +1552,9 @@ def status_summary(store: pathlib.Path) -> dict:
         "by_status": by_status,
         "by_trust": by_trust,
         "audit_events": len(read_audit(store)),
+        "suggestions_pending": sum(1 for s in suggestions if s.get("state") == "pending"),
+        "conflicts_open": sum(1 for c in conflicts if c.get("state") == "open"),
+        "git_contexts": len(load_git_contexts(store)),
     }
 
 
@@ -1190,7 +1970,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_recall = sub.add_parser("recall", help="agent context assembly")
     p_recall.add_argument("query", nargs="?", default="")
-    p_recall.add_argument("--path", help="file path for the path bonus")
+    p_recall.add_argument("--path", help="file path for the tiered path bonus")
+    p_recall.add_argument("--branch", help="current branch for the T5 stored-snapshot bonus")
     p_recall.add_argument("--limit", type=int, default=None)
     p_recall.add_argument("--include-untrusted", action="store_true")
     p_recall.add_argument("--json", action="store_true")
@@ -1220,6 +2001,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="store health + counts")
     p_status.add_argument("--json", action="store_true")
+
+    p_sug = sub.add_parser("suggestions",
+                           help="human review of agent suggestions (T3 approve-to-persist loop)")
+    p_sug.add_argument("action", choices=("list", "approve", "reject"))
+    p_sug.add_argument("sug_id", nargs="?", help="suggestion id (approve/reject)")
+    p_sug.add_argument("--trust", choices=("verified", "approved"),
+                       help="resulting trust level (approve only - never 'system')")
+    p_sug.add_argument("--state", choices=SUGGESTION_STATES, help="filter (list only)")
+    p_sug.add_argument("--json", action="store_true")
+
+    p_conf = sub.add_parser("conflicts",
+                            help="human review of possible-conflict observations (T4)")
+    p_conf.add_argument("action", choices=("scan", "list", "dismiss", "resolve"))
+    p_conf.add_argument("conflict_id", nargs="?", help="conflict record id (dismiss/resolve)")
+    p_conf.add_argument("--old", help="memory id to mark superseded (resolve only)")
+    p_conf.add_argument("--new", help="memory id that supersedes (resolve only)")
+    p_conf.add_argument("--state", choices=CONFLICT_STATES, help="filter (list only)")
+    p_conf.add_argument("--json", action="store_true")
+
+    p_git = sub.add_parser("git",
+                           help="review stored T5 git context (write-time snapshots)")
+    p_git.add_argument("action", choices=("context", "list"))
+    p_git.add_argument("mem_id", nargs="?", help="memory id (context only)")
+    p_git.add_argument("--json", action="store_true")
 
     return parser
 
@@ -1335,8 +2140,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "recall":
             results = recall_memories(
-                store, args.query, path=args.path, limit=args.limit,
-                include_untrusted=args.include_untrusted,
+                store, args.query, path=args.path, branch=args.branch,
+                limit=args.limit, include_untrusted=args.include_untrusted,
             )
             append_audit(store, "MEMORY_ACCESSED", None, "human", {"command": "recall", "count": len(results)})
             if args.json:
@@ -1401,6 +2206,101 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"deleted {args.mem_id} (tombstone)")
             return 0
+        if args.command == "suggestions":
+            if args.action == "list":
+                sugs = list_suggestions(store, state=args.state)
+                if args.json:
+                    _emit_json({"results": sugs, "count": len(sugs)})
+                else:
+                    for s in sugs:
+                        print(f"{s['id']}  [{s['type']}] {s['title']} (state={s['state']})")
+                    print(f"{len(sugs)} result(s)" if sugs else "0 results")
+                return 0
+            if not args.sug_id:
+                raise UsageError(f"suggestions {args.action} requires a suggestion id")
+            if args.action == "approve":
+                if not args.trust:
+                    raise UsageError("suggestions approve requires --trust verified|approved")
+                record = approve_suggestion(store, args.sug_id, args.trust)
+                if args.json:
+                    _emit_json(record)
+                else:
+                    print(f"approved {args.sug_id} -> memory {record['id']} (trust={record['trust']})")
+            else:
+                sug = reject_suggestion(store, args.sug_id)
+                if args.json:
+                    _emit_json(sug)
+                else:
+                    print(f"rejected {args.sug_id}")
+            return 0
+
+        if args.command == "conflicts":
+            if args.action == "scan":
+                report = scan_conflicts(store)
+                if args.json:
+                    _emit_json(report)
+                else:
+                    print(f"scanned {report['scanned']} active memorie(s): "
+                          f"{report['candidates']} new possible conflict(s), "
+                          f"{report['already_open']} already open, "
+                          f"{report['dismissed_unchanged']} dismissed-unchanged skipped")
+                    if report["closed_stale"]:
+                        print(f"  {report['closed_stale']} stale observation(s) closed (state changed)")
+            elif args.action == "list":
+                conflicts = list_conflicts(store, state=args.state)
+                if args.json:
+                    _emit_json({"results": conflicts, "count": len(conflicts)})
+                else:
+                    for c in conflicts:
+                        ex = c.get("explanation", {})
+                        print(f"{c['id']}  [{ex.get('same_type', '?')}] "
+                              f"{c['memory_a']} <-> {c['memory_b']} (state={c['state']})")
+                    print(f"{len(conflicts)} result(s)" if conflicts else "0 results")
+            elif args.action == "dismiss":
+                if not args.conflict_id:
+                    raise UsageError("conflicts dismiss requires a conflict id")
+                rec = dismiss_conflict(store, args.conflict_id)
+                if args.json:
+                    _emit_json(rec)
+                else:
+                    print(f"dismissed {args.conflict_id}")
+            else:  # resolve
+                if not args.conflict_id or not args.old or not args.new:
+                    raise UsageError(
+                        "conflicts resolve requires <conflict_id> --old <id> --new <id>")
+                rec = resolve_conflict(store, args.conflict_id, args.old, args.new)
+                if args.json:
+                    _emit_json(rec)
+                else:
+                    print(f"resolved {args.conflict_id}: {args.old} superseded by {args.new}")
+            return 0
+
+        if args.command == "git":
+            if args.action == "list":
+                snaps = load_git_contexts(store)
+                if args.json:
+                    _emit_json({"results": [
+                        {"mem_id": mid, **snap} for mid, snap in snaps.items()],
+                        "count": len(snaps)})
+                else:
+                    for mid, snap in snaps.items():
+                        branch = snap.get("branch") or "detached"
+                        head = (snap.get("head") or {}).get("short", "?")
+                        print(f"{mid}  branch={branch} head={head}")
+                    print(f"{len(snaps)} result(s)" if snaps else "0 results")
+            else:  # context
+                if not args.mem_id:
+                    raise UsageError("git context requires a memory id")
+                snap = load_git_context(store, args.mem_id)
+                if snap is None:
+                    raise AgentMemoryError(
+                        f"no git context for {args.mem_id} (not captured or not a git repo)")
+                if args.json:
+                    _emit_json(snap)
+                else:
+                    print(json.dumps(snap, indent=2, ensure_ascii=False))
+            return 0
+
         if args.command == "status":
             summary = status_summary(store)
             if args.json:
@@ -1410,6 +2310,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"store         : {summary['store']}")
                 print(f"total memories: {summary['total']}")
                 print(f"audit events  : {summary['audit_events']}")
+                print(f"pending sugg  : {summary['suggestions_pending']}")
+                print(f"open conflicts: {summary['conflicts_open']}")
+                print(f"git contexts  : {summary['git_contexts']}")
                 print("by type      : " + ", ".join(f"{k}={v}" for k, v in summary['by_type'].items()))
                 print("by status    : " + ", ".join(f"{k}={v}" for k, v in summary['by_status'].items()))
                 print("by trust     : " + ", ".join(f"{k}={v}" for k, v in summary['by_trust'].items()))

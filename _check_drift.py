@@ -61,17 +61,19 @@ def spec_command_table() -> list[str]:
 
 
 def main() -> int:
-    # 1. README counts vs actual suites
+    # 1. README counts vs actual suites (unit + external-API audit + MCP)
     unit_actual = suite_checks(HERE / "_test_agent_memory.py")
     audit_actual = suite_checks(HERE / "_audit_cli.py")
+    mcp_actual = suite_checks(HERE / "_test_mcp.py")
     readme = README.read_text(encoding="utf-8", errors="replace")
     stated = [int(n) for n in re.findall(r"\((\d+) checks\)", readme)]
     if not stated:
         guard("README test counts", False, "README states no test count - state them explicitly.")
     for n in stated:
-        if n not in (unit_actual, audit_actual):
+        if n not in (unit_actual, audit_actual, mcp_actual):
             guard("README test counts", False,
-                  f"README states {n} but the suites report unit={unit_actual} audit={audit_actual}")
+                  f"README states {n} but the suites report unit={unit_actual} "
+                  f"audit={audit_actual} mcp={mcp_actual}")
 
     # 2. SPEC constants vs implementation (code-form vs prose-form)
     code = CODE.read_text(encoding="utf-8")
@@ -104,6 +106,46 @@ def main() -> int:
     for cmd in implemented:
         guard(f"impl cmd: {cmd}", cmd in commands,
               f"command {cmd!r} is implemented but missing from the spec table")
+
+    # 3b. README MCP tool list matches the adapter's permission surface
+    mcp_code = (HERE / "agent_memory_mcp.py").read_text(encoding="utf-8")
+    m = re.search(r"ALLOWED_TOOLS = \((.*?)\)", mcp_code, re.S)
+    allowed_names = re.findall(r"`(memory_\w+)`", m.group(1)) if m else []
+    readme_text = README.read_text(encoding="utf-8")
+    for name in allowed_names:
+        guard(f"readme tool: {name}", f"`{name}`" in readme_text,
+              f"tool {name!r} is in ALLOWED_TOOLS but missing from README")
+
+    # 3c. Verb-level contract (EVIDENCE-040 class): every sub-command
+    # "action" verb the parser implements must be documented in the SPEC
+    # 6.2 command-table row AND the README command table. The T4 docs drift
+    # (docs said `conflicts supersede`, code said `conflicts resolve`) was
+    # invisible to the top-level guard 3; this pins the verbs themselves.
+    spec_62 = re.search(r"### 6\.2 Commands(.*?)### 6\.3", spec, re.S)
+    spec_62_text = spec_62.group(1) if spec_62 else ""
+    readme_table = re.search(r"\| Command \| Purpose \|(.*?)Exit codes",
+                             readme_text, re.S)
+    readme_table_text = readme_table.group(1) if readme_table else ""
+    for amatch in re.finditer(r'add_argument\("action", choices=\(([^)]*)\)\)', code):
+        verbs = re.findall(r'"(\w+)"', amatch.group(1))
+        before = code[: amatch.start()]
+        owners = list(re.finditer(r'add_parser\("(\w+)"', before))
+        if not owners:
+            continue
+        cmd = owners[-1].group(1)
+        # Rows are single table lines; capture the WHOLE line so escaped
+        # pipes (\|) inside the flags column do not truncate the match.
+        spec_row = re.search(rf"^\|\s*`{cmd}`\s*\|.*$", spec_62_text, re.M)
+        spec_row_text = spec_row.group(0) if spec_row else ""
+        readme_row = re.search(rf"^\|\s*`{cmd}\b.*$", readme_table_text, re.M)
+        readme_row_text = readme_row.group(0) if readme_row else ""
+        for verb in verbs:
+            guard(f"spec verb: {cmd} {verb}",
+                  bool(re.search(rf"\b{verb}\b", spec_row_text)),
+                  f"verb {verb!r} of command {cmd!r} not in the SPEC 6.2 row")
+            guard(f"readme verb: {cmd} {verb}",
+                  bool(re.search(rf"\b{verb}\b", readme_row_text)),
+                  f"verb {verb!r} of command {cmd!r} not in the README command table")
 
     # 4. Python >= 3.11 in pyproject
     try:

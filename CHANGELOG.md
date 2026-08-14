@@ -5,6 +5,95 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 Tier 5, git awareness - EVIDENCE-041)
+- Write-time git context capture: when a memory is created (CLI add, MCP
+  memory_create, approval conversion) or suggested, agent-memory MAY
+  capture a versioned snapshot (`.agent/gitcontext/<mem_id>.json`,
+  schema `git-context-v1`) via the real `git` CLI: repository identity,
+  current branch, HEAD commit (sha/author/timestamp), changed paths.
+  Fail-soft: any git failure yields NO snapshot and NO error - memory
+  operations continue unchanged.
+- New CLI review surface: `git context <mem_id>`, `git list`, and a
+  `git_contexts` count in `status`. Human-CLI only - the MCP surface
+  stays exactly 7 tools (no git tool, no git args).
+- Deterministic retrieval enrichment: `recall --branch B` and the
+  existing `--path` now apply a bounded bonus from STORED snapshots only
+  (changed-path overlap via path_tier tiers, branch equality). The bonus
+  reorders within the already-qualified set - it never expands recall
+  and never rescues weak text from the floor. Author/timestamp/commit
+  are evidence, never scored.
+- Suggestions capture git context at propose and carry it through
+  approval (the approved memory keeps the proposal's context).
+- +32 unit checks (379 total), +12 external-API audit checks (173),
+  MCP forbidden set extended; spec section 19 + README updated in the
+  same commit (drift-guard clean).
+### Added (v0.3 Tier 4, possible-conflict detection - EVIDENCE-038/039)
+- New CLI `conflicts` review commands: `conflicts scan` (on-demand,
+  deterministic possible-conflict detection over ACTIVE memories),
+  `conflicts list [--state open|dismissed|resolved]`, `conflicts
+  dismiss <cf_id>`, `conflicts resolve <cf_id> --old <old_id>
+  --new <new_id>` (resolution wires the existing `supersede()`).
+- Narrow candidate definition (EVIDENCE-038): same type + shared path
+  (path_matches) + ≥2 shared high-weight terms + ≥1 distinctive shared
+  term; already-related pairs ineligible (supersession-linked, already
+  open, dismissed since content changed).
+- A conflict record is an OBSERVATION, not a memory: `.agent/conflicts/
+  cf_<uuid>.json`, separate id space, no schema change, no new memory
+  status. The explanation carries WHY (shared paths/terms/type, trust and
+  age of each) - never a winner, never a `relationship: supersedes`
+  conclusion. Trust/age explain, they never decide.
+- Dismissal is an audited human decision and NOT permanent: if either
+  member's content changes, the pair becomes eligible again. Resolution
+  reuses the existing `supersede()` machinery. Stale open records are
+  closed by later scans (CONFLICT_CLOSED).
+- Human-CLI only: no conflict tool on the MCP agent surface (an agent
+  can neither act on nor see conflicts).
+- `status` now reports the open-conflict count.
+- +45 unit checks (347 total), +21 external-API audit checks (161),
+  MCP surface pin extended (conflict commands forbidden); spec section
+  18 + README updated in the same commit (drift-guard clean).
+### Added (v0.3 Tier 3, suggestions - approve-to-persist loop - EVIDENCE-034)
+- `memory_suggest` now ENQUEUES a validated, secret-screened pending
+  suggestion (`.agent/suggestions/sug_<uuid>.json`) instead of returning a
+  preview: the AI proposes, the SYSTEM decides. A suggestion is NOT a
+  memory - no trust/status fields, never enters recall/lifecycle until
+  approved.
+- New CLI review commands: `suggestions list [--state ...]`,
+  `suggestions approve <sug_id> --trust verified|approved`,
+  `suggestions reject <sug_id>`. Approval creates the memory through the
+  existing trust ladder (the human explicitly picks the trust level; never
+  `system`). Approve/reject are human-only and never exposed on the MCP
+  agent surface - an agent can never approve its own suggestion. Both are
+  TERMINAL and audited (SUGGESTION_CREATED/APPROVED/REJECTED).
+- Secrets are rejected BEFORE any suggestion is written (the queue is not
+  a backdoor persistence mechanism); approval re-screens the stored
+  proposal against disk tampering.
+- `memory_create` retained unchanged as a documented lower-level escape
+  hatch (agent-created untrusted memory, promoted by humans).
+- `status` now reports the pending-suggestion count.
+- +45 unit checks (302 total), +13 external-API audit checks (140),
+  +7 MCP checks (70); spec section 17 + README updated in the same
+  commit (drift-guard clean).
+### Added (v0.3 Tier 2.1, path-aware ranking - EVIDENCE-031)
+- `--path` is now a TIERED ranking signal instead of a flat +10: exact
+  file (10) > bare directory (6) > glob/prefix (3) > unrelated (0). A
+  bare directory pattern (`src/auth`) now routes to files under it.
+  Text relevance still matters - path is a signal, not an auto-win.
+- New `path_tier()` pure function + 19 unit checks (257 total); spec
+  section 8 + README updated in the same commit (drift-guard clean).
+### Added (v0.3 Tier 1, agent interface - MCP)
+- `agent_memory_mcp.py`: stdio MCP server (official MCP SDK, optional
+  `[mcp]` extra; core stays stdlib-only). Tools: memory_recall,
+  memory_search, memory_get, memory_history, memory_suggest,
+  memory_create, memory_validate.
+- Permission boundary enforced by the tool surface: delete/promote/
+  supersede/import are NOT exposed to agent sessions; provenance forced
+  to agent; secret detection never overridable; audit actor = agent.
+- `memory_suggest` returns a validated candidate preview (no
+  persistence) - the AI proposes, the system decides.
+- 63-check companion suite (incl. stdio round-trip over the real server);
+  `_check_drift.py` now validates the third suite's README count and
+  cross-checks the README tool list against ALLOWED_TOOLS.
 ### Added (v0.2 Tier 2.3, rule-log source - EVIDENCE-023)
 - `import --source rule-log`: the numbered RULES OF ENGAGEMENT (sections
   1-6 of agent-log-ai/rules.txt) as `constraint` memories - the T9

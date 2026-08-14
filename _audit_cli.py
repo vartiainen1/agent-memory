@@ -589,6 +589,215 @@ def audit_status():
 
 
 # ==========================================================================
+# suggestions - T3 approve-to-persist review loop (human CLI side)
+# ==========================================================================
+
+def audit_suggestions():
+    p = Project()
+    p.init()
+    r = p.run("suggestions", "list")
+    ok("suggestions: empty list -> 0 results exit 0",
+       r.returncode == 0 and "0 results" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+
+    # Seed two pending suggestions exactly as the core writes them (the
+    # agent surface is MCP; the CLI owns the human review side).
+    sug_dir = p.store() / "suggestions"
+    sug_dir.mkdir(parents=True, exist_ok=True)
+    base = {
+        "format_version": 1, "type": "error", "title": "t",
+        "content": "c", "project": p.name, "provenance": "agent",
+        "severity": "normal", "tags": [], "paths": [],
+        "created_at": "2026-08-13T00:00:00Z", "state": "pending",
+        "approved_at": None, "approved_by": None,
+        "rejected_at": None, "rejected_by": None,
+    }
+    s1 = dict(base, id="sug_11111111-0000-0000-0000-000000000001",
+              title="refresh tokens", content="tokens were reusable")
+    s2 = dict(base, id="sug_11111111-0000-0000-0000-000000000002",
+              title="bad idea", content="should never become memory")
+    for s in (s1, s2):
+        (sug_dir / f"{s['id']}.json").write_text(
+            json.dumps(s, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    r = p.run("suggestions", "list")
+    ok("suggestions: pending listed with state",
+       r.returncode == 0 and "refresh tokens" in r.stdout
+       and "state=pending" in r.stdout, r.stdout)
+
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001")
+    ok("suggestions: approve without --trust -> exit 2", r.returncode == 2,
+       f"rc={r.returncode}")
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001",
+              "--trust", "system")
+    ok("suggestions: approve --trust system -> exit 2", r.returncode == 2,
+       f"rc={r.returncode}")
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001",
+              "--trust", "approved")
+    ok("suggestions: approve exit 0 + trust + memory id",
+       r.returncode == 0 and "trust=approved" in r.stdout and "mem_" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    m = re.search(r"memory (mem_[0-9a-f-]+)", r.stdout)
+    mem_id = m.group(1) if m else ""
+    r = p.run("recall", "refresh")
+    ok("suggestions: approved suggestion recalled", "RELEVANT CONTEXT" in r.stdout,
+       r.stdout)
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000001",
+              "--trust", "verified")
+    ok("suggestions: double-approve -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode} err={r.stderr!r}")
+
+    r = p.run("suggestions", "reject", "sug_11111111-0000-0000-0000-000000000002", "--json")
+    parsed = json.loads(r.stdout)
+    ok("suggestions: reject --json -> rejected record",
+       r.returncode == 0 and parsed["state"] == "rejected", f"out={r.stdout!r}")
+    r = p.run("suggestions", "approve", "sug_11111111-0000-0000-0000-000000000002",
+              "--trust", "verified")
+    ok("suggestions: approve after reject -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode}")
+    r = p.run("suggestions", "approve", "sug_none", "--trust", "verified")
+    ok("suggestions: missing id -> exit 1 clean message",
+       r.returncode == 1 and "no suggestion" in (r.stderr or ""),
+       f"rc={r.returncode} err={r.stderr!r}")
+
+    events = p.audit_events()
+    ok("suggestions: SUGGESTION_APPROVED + REJECTED audited",
+       events.count("SUGGESTION_APPROVED") == 1
+       and events.count("SUGGESTION_REJECTED") == 1, str(events))
+    ids = p.all_ids()
+    ok("suggestions: only the approved suggestion became memory",
+       len(ids) == 1 and mem_id in ids, str(ids))
+    st = json.loads(p.run("status", "--json").stdout)
+    ok("suggestions: status pending count 0 after review",
+       st["suggestions_pending"] == 0, json.dumps(st)[:200])
+
+
+def audit_conflicts():
+    """T4 (EVIDENCE-038): narrow possible-conflict detection, human-only
+    review (dismiss / resolve via existing supersede), audited lifecycle."""
+    p = Project()
+    p.init()
+    r = p.run("conflicts", "scan")
+    ok("conflicts: empty store scan -> 0 candidates exit 0",
+       r.returncode == 0 and "0 new possible conflict" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    r = p.run("conflicts", "list")
+    ok("conflicts: empty list -> 0 results exit 0",
+       r.returncode == 0 and "0 results" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+
+    # Narrow candidate: same type + shared path + meaningful overlap.
+    p.add("decision", "auth refresh token timeout",
+          "token refresh invalidation session policy",
+          "--paths", "src/auth/**", "--tags", "auth")
+    p.add("decision", "auth session invalidation",
+          "session token refresh invalidation policy",
+          "--paths", "src/auth/session.py", "--tags", "auth")
+    p.add("decision", "frontend button layout", "padding margin css layout",
+          "--paths", "src/frontend/**")  # unrelated scope, never flagged
+    r = p.run("conflicts", "scan")
+    ok("conflicts: scan finds exactly the overlapping pair",
+       r.returncode == 0 and "1 new possible conflict" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    r = p.run("conflicts", "scan")
+    ok("conflicts: re-scan dedupes (0 new, 1 already open)",
+       r.returncode == 0 and "0 new possible conflict" in r.stdout
+       and "1 already open" in r.stdout, f"out={r.stdout!r}")
+    r = p.run("conflicts", "list", "--json")
+    data = json.loads(r.stdout)
+    ok("conflicts: list --json 1 open record with explanation",
+       data["count"] == 1 and data["results"][0]["state"] == "open"
+       and "shared_high_weight_terms" in data["results"][0]["explanation"]
+       and "winner" not in data["results"][0]["explanation"],
+       f"out={r.stdout[:300]!r}")
+    cf = data["results"][0]["id"]
+    ok("conflicts: id space is cf_", cf.startswith("cf_"), cf)
+
+    # Dismiss path: terminal while memories unchanged.
+    r = p.run("conflicts", "dismiss", cf)
+    ok("conflicts: dismiss exit 0", r.returncode == 0 and "dismissed" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    r = p.run("conflicts", "dismiss", cf)
+    ok("conflicts: re-dismiss -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode} err={r.stderr!r}")
+    r = p.run("conflicts", "scan")
+    ok("conflicts: dismissed-unchanged pair skipped by scan",
+       r.returncode == 0 and "1 dismissed-unchanged skipped" in r.stdout,
+       f"out={r.stdout!r}")
+    r = p.run("conflicts", "list", "--state", "dismissed")
+    ok("conflicts: dismissed record listed by state filter",
+       "state=dismissed" in r.stdout, f"out={r.stdout!r}")
+
+    # Resolve path: reuses the existing supersede() machinery.
+    p2 = Project()
+    p2.init()
+    p2.add("decision", "auth refresh token timeout",
+           "token refresh invalidation session policy",
+           "--paths", "src/auth/**", "--tags", "auth")
+    p2.add("decision", "auth session invalidation",
+           "session token refresh invalidation policy",
+           "--paths", "src/auth/session.py", "--tags", "auth")
+    p2.run("conflicts", "scan")
+    r = p2.run("conflicts", "list", "--json")
+    cf2 = json.loads(r.stdout)["results"][0]["id"]
+    ids = p2.all_ids()
+    old = ids[0]
+    new = ids[1]
+    r = p2.run("conflicts", "resolve", cf2, "--old", old, "--new", new)
+    ok("conflicts: resolve exit 0 + supersede message",
+       r.returncode == 0 and "superseded by" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    o = json.loads(p2.run("show", old, "--json").stdout)
+    n = json.loads(p2.run("show", new, "--json").stdout)
+    ok("conflicts: resolve wired supersession links",
+       o["status"] == "superseded" and o["superseded_by"] == new
+       and n["supersedes"] == old, f"old={o['status']} new={n['supersedes']}")
+    r = p2.run("conflicts", "resolve", cf2, "--old", old, "--new", new)
+    ok("conflicts: re-resolve -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode}")
+
+    # Guards and errors.
+    p3 = Project()
+    p3.init()
+    p3.add("decision", "auth refresh token timeout",
+           "token refresh invalidation session policy",
+           "--paths", "src/auth/**", "--tags", "auth")
+    p3.add("decision", "auth session invalidation",
+           "session token refresh invalidation policy",
+           "--paths", "src/auth/session.py", "--tags", "auth")
+    p3.run("conflicts", "scan")
+    r = p3.run("conflicts", "list", "--json")
+    cf3 = json.loads(r.stdout)["results"][0]["id"]
+    r = p3.run("conflicts", "resolve")
+    ok("conflicts: resolve missing args -> exit 2", r.returncode == 2,
+       f"rc={r.returncode}")
+    r = p3.run("conflicts", "resolve", cf3, "--old", "mem_x", "--new", "mem_y")
+    ok("conflicts: resolve missing memories -> exit 1", r.returncode == 1,
+       f"rc={r.returncode}")
+    r = p3.run("conflicts", "dismiss", "cf_00000000-0000-0000-0000-000000000000")
+    ok("conflicts: dismiss missing id -> exit 1 clean message",
+       r.returncode == 1 and "no conflict record" in (r.stderr or ""),
+       f"rc={r.returncode} err={r.stderr!r}")
+    r = p3.run("conflicts", "bogus")
+    ok("conflicts: bad action -> exit 2", r.returncode == 2, f"rc={r.returncode}")
+
+    events = p.audit_events()
+    ok("conflicts: CONFLICT_DETECTED + CONFLICT_DISMISSED audited",
+       "CONFLICT_DETECTED" in events and "CONFLICT_DISMISSED" in events,
+       str(events))
+    events2 = p2.audit_events()
+    ok("conflicts: MEMORY_SUPERSEDED + CONFLICT_RESOLVED audited on resolve",
+       "MEMORY_SUPERSEDED" in events2 and "CONFLICT_RESOLVED" in events2,
+       str(events2))
+    st = json.loads(p2.run("status", "--json").stdout)
+    ok("conflicts: status reports open conflict count 0 after resolve",
+       st["conflicts_open"] == 0, json.dumps(st)[:200])
+    st1 = json.loads(p.run("status", "--json").stdout)
+    ok("conflicts: status reports open count on dismissed project",
+       st1["conflicts_open"] == 0, json.dumps(st1)[:200])
+
+
+# ==========================================================================
 # not-initialized across commands + project discovery + corrupt config
 # ==========================================================================
 
@@ -703,6 +912,87 @@ def audit_json_errors_and_meta():
 
 
 # ==========================================================================
+# git - T5 write-time context + stored-snapshot recall enrichment (EVIDENCE-041)
+# ==========================================================================
+
+def audit_git():
+    """T5 (EVIDENCE-041): versioned sidecar capture in a real git repo,
+    CLI review surface, non-git fail-soft fallback, recall --branch."""
+    # -- non-git project: fail-soft, no gitcontext dir, no git commands ----
+    p = Project()
+    p.init()
+    p.add("decision", "plain memory", "no git here")
+    r = p.run("git", "list")
+    ok("git: non-git project git list -> 0 results exit 0",
+       r.returncode == 0 and "0 results" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    ok("git: non-git project no gitcontext dir",
+       not (p.store() / "gitcontext").exists())
+    r = p.run("status", "--json")
+    ok("git: non-git status git_contexts 0",
+       json.loads(r.stdout)["git_contexts"] == 0,
+       f"out={r.stdout!r}")
+
+    # -- real git repo: capture + review + recall -------------------------
+    q = Project()
+    # make q.dir a real git repo with one commit touching src/auth/login.py
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=str(q.dir), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=str(q.dir),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(q.dir),
+                       check=True, capture_output=True)
+        d = q.dir / "src" / "auth"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "login.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(q.dir), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "auth init"], cwd=str(q.dir),
+                       check=True, capture_output=True)
+        git_ok = True
+    except (subprocess.SubprocessError, OSError):
+        git_ok = False
+    if not git_ok:
+        ok("git: real-repo checks skipped (git unavailable)", True)
+        return
+
+    q.init()
+    q.add("decision", "auth gate", "all auth through the gate", "--paths", "src/auth/**")
+    r = q.run("list", "--json")
+    mem_id = json.loads(r.stdout)["results"][0]["id"]
+    q.run("promote", mem_id, "--trust", "verified")  # recall excludes untrusted
+    r = q.run("git", "context", mem_id, "--json")
+    ok("git: context exit 0 + versioned schema",
+       r.returncode == 0 and "git-context-v1" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    snap = json.loads(r.stdout)
+    ok("git: changed paths include the committed file",
+       "src/auth/login.py" in snap.get("changed_paths", []),
+       f"out={snap.get('changed_paths')}")
+    ok("git: branch captured", snap.get("branch") in ("master", "main"),
+       f"out={snap.get('branch')}")
+    r = q.run("git", "list")
+    ok("git: list shows the memory", mem_id in r.stdout, f"out={r.stdout!r}")
+    r = q.run("status")
+    ok("git: status reports 1 git context", "git contexts  : 1" in r.stdout,
+       f"out={r.stdout!r}")
+    # recall --branch: matches recall; other branch no exclusion (bonus only)
+    r = q.run("recall", "gate", "--branch", snap["branch"], "--json")
+    ok("git: recall --branch returns the memory",
+       r.returncode == 0 and json.loads(r.stdout)["count"] == 1,
+       f"out={r.stdout!r}")
+    r = q.run("recall", "gate", "--branch", "other", "--json")
+    ok("git: other branch no exclusion",
+       json.loads(r.stdout)["count"] == 1, f"out={r.stdout!r}")
+    # error paths
+    r = q.run("git", "context", "mem_nope")
+    ok("git: missing context exit 1", r.returncode == 1, f"rc={r.returncode}")
+    r = q.run("git", "context")
+    ok("git: context without id exit 2", r.returncode == 2, f"rc={r.returncode}")
+
+
+# ==========================================================================
 
 def main() -> int:
     print("=== agent-memory external-API audit (v0.1) ===")
@@ -715,6 +1005,9 @@ def main() -> int:
     audit_supersede()
     audit_delete()
     audit_status()
+    audit_suggestions()
+    audit_conflicts()
+    audit_git()
     audit_discovery_errors()
     audit_json_errors_and_meta()
     cleanup_all()

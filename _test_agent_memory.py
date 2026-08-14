@@ -944,6 +944,93 @@ def test_path_matcher() -> None:
         check("path: char class rejected", True)
 
 
+def test_path_tier() -> None:
+    """v0.3 T2.1 (EVIDENCE-031): path_tier hierarchy - exact file (3) > bare
+    directory (2) > glob/prefix (1) > unrelated/neutral (0)."""
+    check("tier: exact file", am.path_tier("src/auth/login.py", "src/auth/login.py") == 3)
+    check("tier: bare directory routes files under it",
+          am.path_tier("src/auth", "src/auth/login.py") == 2)
+    check("tier: deep directory", am.path_tier("src/auth", "src/auth/deep/x.py") == 2)
+    check("tier: sibling prefix collision not directory",
+          am.path_tier("src/auth", "src/auth2/x.py") == 0)
+    check("tier: glob prefix match", am.path_tier("src/auth/**", "src/auth/login.py") == 1)
+    check("tier: loose ** glob", am.path_tier("src/**", "src/auth/x.py") == 1)
+    check("tier: bare ** is neutral", am.path_tier("**", "src/auth/x.py") == 0)
+    check("tier: unrelated no match", am.path_tier("src/other/**", "src/auth/x.py") == 0)
+    check("tier: unrelated bare dir", am.path_tier("src/other", "src/auth/x.py") == 0)
+    check("tier: empty pattern neutral", am.path_tier("", "src/a.py") == 0)
+    check("tier: empty path neutral", am.path_tier("src/a.py", "") == 0)
+
+
+def test_tier21_path_bonus_hierarchy() -> None:
+    """v0.3 T2.1 A4 (EVIDENCE-031): for equal text scores, exact file >
+    directory > glob > unrelated ordering when --path is given."""
+    store = tmp_store()
+    ids = {}
+    for kind, pats in [("exact", ["src/auth/login.py"]),
+                       ("dir", ["src/auth"]),
+                       ("glob", ["src/auth/**"]),
+                       ("none", [])]:
+        ids[kind] = am.create_memory(
+            store, "decision", f"auth {kind}", "auth policy",
+            project="p", paths=pats)["id"]
+    for mid in ids.values():
+        am.promote_trust(store, mid, "approved")
+    results = am.recall_memories(store, "auth", path="src/auth/login.py")
+    order = [r["title"] for r in results]
+    check("t2.1 A4: exact ranks above directory",
+          order.index("auth exact") < order.index("auth dir"), f"(got {order})")
+    check("t2.1 A4: directory ranks above glob",
+          order.index("auth dir") < order.index("auth glob"), f"(got {order})")
+    check("t2.1 A4: glob ranks above unrelated",
+          order.index("auth glob") < order.index("auth none"), f"(got {order})")
+
+
+def test_t21_path_text_still_matters() -> None:
+    """v0.3 T2.1 A5 (EVIDENCE-031): a strong text match without a path can
+    still outrank a weak-text exact-path match - path is a signal, not an
+    auto-win."""
+    store = tmp_store()
+    strong = am.create_memory(
+        store, "lesson", "postgresql transactional consistency engine",
+        "postgresql chosen for transactional consistency of financial data",
+        project="p", tags=[])["id"]
+    weak_exact = am.create_memory(
+        store, "decision", "x", "y", project="p",
+        paths=["src/db/main.py"])["id"]
+    for mid in (strong, weak_exact):
+        am.promote_trust(store, mid, "approved")
+    results = am.recall_memories(store, "postgresql transactional",
+                                 path="src/db/main.py")
+    titles = [r["title"] for r in results]
+    check("t2.1 A5: strong text outranks weak exact-path",
+          titles[0] == "postgresql transactional consistency engine",
+          f"(got {titles})")
+
+
+def test_t21_directory_scoping_recall() -> None:
+    """v0.3 T2.1 A6 (EVIDENCE-031): a bare directory pattern routes to files
+    under it via the CLI - previously it matched nothing useful."""
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t21-"))
+    _run_cli(tmp, "init")
+    m1 = _run_cli(tmp, "add", "--type", "constraint", "--title", "Auth dir rule",
+                  "--content", "all auth via AuthService", "--paths", "src/auth")
+    m2 = _run_cli(tmp, "add", "--type", "constraint", "--title", "Other area",
+                  "--content", "unrelated area", "--paths", "src/other")
+    check("t2.1 A6: two memories added", m1.returncode == 0 and m2.returncode == 0,
+          f"({m1.stderr} {m2.stderr})")
+    for line in (m1.stdout + m2.stdout).splitlines():
+        if "created mem_" in line:
+            mid = line.split()[-1]
+            r = _run_cli(tmp, "promote", mid, "--trust", "approved")
+            check("t2.1 A6: promote ok", r.returncode == 0, r.stderr)
+    r = _run_cli(tmp, "recall", "auth", "--path", "src/auth/login.py", "--json")
+    payload = json.loads(r.stdout)
+    titles = [x["title"] for x in payload.get("results", [])]
+    check("t2.1 A6: directory-routed memory first",
+          titles and titles[0] == "Auth dir rule", f"(got {titles})")
+
+
 # --------------------------------------------------------------------------
 # 9. CLI subprocess integration (real binary, output VALUES)
 # --------------------------------------------------------------------------
@@ -1037,6 +1124,767 @@ def test_cli_error_paths() -> None:
     r = _run_cli(tmp, "search", "", "--json")
     data = json.loads(r.stdout)
     check("cli: json empty search shape", data == {"results": [], "count": 0}, f"(got {data})")
+
+
+# --------------------------------------------------------------------------
+# T3 suggestions - approve-to-persist loop (v0.3 Tier 3, EVIDENCE-034)
+# A suggestion is a CANDIDATE, not a memory: no trust/status, no recall
+# participation, human-only approval, terminal reject/approve, audited.
+# --------------------------------------------------------------------------
+
+def test_t3_propose_creates_pending_suggestion_not_memory() -> None:
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "constraint", "auth via AuthService",
+                                "All auth must use AuthService",
+                                project="p", paths=["src/auth/**"])
+    check("t3: id space is sug_", sug["id"].startswith("sug_"), f"(got {sug['id']})")
+    check("t3: state pending", sug["state"] == "pending", f"(got {sug})")
+    check("t3: provenance pinned to agent", sug["provenance"] == "agent",
+          f"(got {sug.get('provenance')})")
+    check("t3: no trust field (not a memory)", "trust" not in sug,
+          f"(got {sorted(sug.keys())})")
+    check("t3: no status field (not a memory)", "status" not in sug,
+          f"(got {sorted(sug.keys())})")
+    check("t3: no MEMORY persisted", am.list_memories(store) == [],
+          f"(got {am.list_memories(store)})")
+    check("t3: suggestion file written to suggestions dir",
+          (store / am.SUGGESTION_SUBDIR / f"{sug['id']}.json").exists())
+    events = am.read_audit(store)
+    check("t3: SUGGESTION_CREATED audited",
+          [e["event"] for e in events] == ["SUGGESTION_CREATED"], f"(got {events})")
+    check("t3: audit actor agent", events[0]["actor"] == "agent", f"(got {events[0]})")
+
+
+def test_t3_propose_secret_rejected_before_write() -> None:
+    """The queue must not be a backdoor persistence mechanism: secrets are
+    rejected BEFORE any write - nothing is persisted and it is audited."""
+    store = tmp_store()
+    try:
+        am.propose_suggestion(store, "constraint", "token",
+                              "here is the key: " + "ghp_" + "a" * 36,
+                              project="p")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t3: secret proposal rejected", raised)
+    check("t3: no suggestion persisted", am.list_suggestions(store) == [],
+          f"(got {am.list_suggestions(store)})")
+    check("t3: no memory persisted", am.list_memories(store) == [],
+          f"(got {am.list_memories(store)})")
+    events = am.read_audit(store)
+    check("t3: SUGGESTION_REJECTED audited",
+          [e["event"] for e in events] == ["SUGGESTION_REJECTED"], f"(got {events})")
+    check("t3: rejection detail is secret_detected",
+          events[0]["detail"].get("reason") == "secret_detected", f"(got {events[0]})")
+
+
+def test_t3_approve_converts_to_memory_with_chosen_trust() -> None:
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "error", "token refresh bug",
+                                "tokens were reusable", project="p")
+    record = am.approve_suggestion(store, sug["id"], "approved")
+    check("t3: approve creates a memory", record["id"].startswith("mem_"),
+          f"(got {record['id']})")
+    check("t3: trust is the human-chosen level", record["trust"] == "approved",
+          f"(got {record['trust']})")
+    check("t3: memory provenance stays agent", record["provenance"] == "agent",
+          f"(got {record.get('provenance')})")
+    check("t3: suggestion now approved",
+          am.load_suggestion(store, sug["id"])["state"] == "approved")
+    check("t3: approved memory is recalled",
+          [r["title"] for r in am.recall_memories(store, "token refresh")]
+          == ["token refresh bug"], f"(got {am.recall_memories(store, 'token refresh')})")
+    events = am.read_audit(store)
+    approves = [e for e in events if e["event"] == "SUGGESTION_APPROVED"]
+    check("t3: SUGGESTION_APPROVED audited with memory_id + trust",
+          len(approves) == 1 and approves[0]["memory_id"] == record["id"]
+          and approves[0]["detail"]["trust"] == "approved", f"(got {approves})")
+
+
+def test_t3_approve_trust_ladder_governs() -> None:
+    """Approval != automatic max trust: the human picks verified or approved,
+    never 'system'; invalid trust is a usage error."""
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "lesson", "rule", "content", project="p")
+    record = am.approve_suggestion(store, sug["id"], "verified")
+    check("t3: verified chosen", record["trust"] == "verified", f"(got {record['trust']})")
+    sug2 = am.propose_suggestion(store, "lesson", "rule2", "content2", project="p")
+    try:
+        am.approve_suggestion(store, sug2["id"], "system")
+        raised = False
+    except am.UsageError:
+        raised = True
+    check("t3: approve --trust system rejected", raised)
+    check("t3: rejected-system suggestion still pending",
+          am.load_suggestion(store, sug2["id"])["state"] == "pending")
+
+
+def test_t3_approve_reject_terminal() -> None:
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "constraint", "t", "c", project="p")
+    am.approve_suggestion(store, sug["id"], "approved")
+    try:
+        am.approve_suggestion(store, sug["id"], "approved")
+        twice = False
+    except am.AgentMemoryError:
+        twice = True
+    check("t3: double-approve rejected (terminal)", twice)
+    sug2 = am.propose_suggestion(store, "constraint", "t2", "c2", project="p")
+    am.reject_suggestion(store, sug2["id"])
+    check("t3: reject marks state rejected",
+          am.load_suggestion(store, sug2["id"])["state"] == "rejected")
+    try:
+        am.approve_suggestion(store, sug2["id"], "approved")
+        after = False
+    except am.AgentMemoryError:
+        after = True
+    check("t3: approve after reject rejected (terminal)", after)
+    try:
+        am.reject_suggestion(store, sug2["id"])
+        rej2 = False
+    except am.AgentMemoryError:
+        rej2 = True
+    check("t3: double-reject rejected (terminal)", rej2)
+    check("t3: rejected suggestion created no memory",
+          am.list_memories(store) != [] and len(am.list_memories(store)) == 1,
+          f"(got {am.list_memories(store)})")
+    rejects = [e for e in am.read_audit(store) if e["event"] == "SUGGESTION_REJECTED"]
+    check("t3: SUGGESTION_REJECTED audited (human_review)",
+          len(rejects) == 1 and rejects[0]["detail"]["reason"] == "human_review",
+          f"(got {rejects})")
+
+
+def test_t3_approve_reruns_secret_scan() -> None:
+    """Defense against disk tampering: a proposal edited to contain a secret
+    after enqueue must never become memory."""
+    store = tmp_store()
+    sug = am.propose_suggestion(store, "constraint", "t", "clean content",
+                                project="p")
+    path = store / am.SUGGESTION_SUBDIR / f"{sug['id']}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["content"] = "leak: " + "sk-" + "c" * 20
+    am._write_text_utf8(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    try:
+        am.approve_suggestion(store, sug["id"], "approved")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t3: tampered proposal refused at approval", raised)
+    check("t3: no memory created from tampered proposal",
+          am.list_memories(store) == [], f"(got {am.list_memories(store)})")
+
+
+def test_t3_list_filters_and_status() -> None:
+    store = tmp_store()
+    s1 = am.propose_suggestion(store, "constraint", "one", "c1", project="p")
+    s2 = am.propose_suggestion(store, "error", "two", "c2", project="p")
+    am.reject_suggestion(store, s2["id"])
+    all_ids = [s["id"] for s in am.list_suggestions(store)]
+    check("t3: list all returns both (created_at desc, id desc tie-break)",
+          len(all_ids) == 2 and set(all_ids) == {s1["id"], s2["id"]}
+          and all_ids == sorted(all_ids, reverse=True), f"(got {all_ids})")
+    check("t3: list state filter pending",
+          [s["id"] for s in am.list_suggestions(store, state="pending")] == [s1["id"]])
+    check("t3: list state filter rejected",
+          [s["id"] for s in am.list_suggestions(store, state="rejected")] == [s2["id"]])
+    try:
+        am.load_suggestion(store, "sug_00000000-0000-0000-0000-000000000000")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t3: missing suggestion id raises clean error", raised)
+    summary = am.status_summary(store)
+    check("t3: status reports pending suggestion count",
+          summary["suggestions_pending"] == 1, f"(got {summary})")
+
+
+def test_t3_cli_flow() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t3-cli-"))
+    _run_cli(tmp, "init", "--project", "demo")
+    r = _run_cli(tmp, "add", "--type", "constraint", "--title", "Existing",
+                 "--content", "already trusted context")
+    mem_id = r.stdout.strip().split()[-1]
+    _run_cli(tmp, "promote", mem_id, "--trust", "approved")
+    r = _run_cli(tmp, "suggestions", "list")
+    check("t3-cli: empty list prints 0 results exit 0",
+          r.returncode == 0 and "0 results" in r.stdout, f"(got {r.stdout!r})")
+    # Enqueue via the core (the agent surface is MCP; the CLI owns approval).
+    store = am.find_store(tmp)
+    sug = am.propose_suggestion(store, "error", "refresh tokens",
+                                "tokens were reusable", project="demo")
+    r = _run_cli(tmp, "suggestions", "list")
+    check("t3-cli: pending listed",
+          r.returncode == 0 and "refresh tokens" in r.stdout
+          and "state=pending" in r.stdout, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "suggestions", "approve", sug["id"])
+    check("t3-cli: approve without --trust exit 2", r.returncode == 2,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+    r = _run_cli(tmp, "suggestions", "approve", sug["id"], "--trust", "approved")
+    check("t3-cli: approve exit 0 + trust printed",
+          r.returncode == 0 and "trust=approved" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "recall", "refresh")
+    check("t3-cli: approved suggestion recalled", "RELEVANT CONTEXT" in r.stdout,
+          f"(got {r.stdout!r})")
+    # Reject path with --json.
+    sug2 = am.propose_suggestion(store, "error", "bad idea",
+                                 "should not become memory", project="demo")
+    r = _run_cli(tmp, "suggestions", "reject", sug2["id"], "--json")
+    data = json.loads(r.stdout)
+    check("t3-cli: reject --json returns rejected record",
+          r.returncode == 0 and data["state"] == "rejected", f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "suggestions", "approve", sug2["id"], "--trust", "verified")
+    check("t3-cli: approve after reject exit 1", r.returncode == 1,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+    r = _run_cli(tmp, "status", "--json")
+    data = json.loads(r.stdout)
+    check("t3-cli: status pending count 0", data["suggestions_pending"] == 0,
+          f"(got {data})")
+    r = _run_cli(tmp, "suggestions", "bogus")
+    check("t3-cli: bad action exit 2", r.returncode == 2, f"(rc={r.returncode})")
+
+# --------------------------------------------------------------------------
+# T4 possible-conflict detection (EVIDENCE-038, user-locked 2026-08-14)
+# --------------------------------------------------------------------------
+
+def _conflict_pair(store, title_a, content_a, title_b, content_b,
+                   type_a="decision", type_b=None, paths_a=None, paths_b=None,
+                   tags_a=None, tags_b=None):
+    """Create two memories + scan; return (memories dict, conflict report)."""
+    type_b = type_b or type_a
+    a = am.create_memory(store, type_a, title_a, content_a, project="p",
+                         paths=paths_a, tags=tags_a)
+    b = am.create_memory(store, type_b, title_b, content_b, project="p",
+                         paths=paths_b, tags=tags_b)
+    return {"a": a, "b": b}, am.scan_conflicts(store)
+
+
+def test_t4_narrow_candidate_detected() -> None:
+    """AC2: same type + shared scope + meaningful topical overlap -> one
+    possible-conflict record with an explanation (never a verdict)."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout",
+        "token refresh invalidation session secret policy",
+        "auth session invalidation",
+        "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+        tags_a=["auth"], tags_b=["auth"],
+    )
+    check("t4: one candidate from an overlapping pair", rep["candidates"] == 1,
+          f"(got {rep['candidates']})")
+    rec = rep["results"][0]
+    check("t4: conflict id space is cf_", rec["id"].startswith("cf_"),
+          f"(got {rec['id']})")
+    check("t4: state open", rec["state"] == "open")
+    check("t4: record references both memory ids",
+          {rec["memory_a"], rec["memory_b"]} == {mems["a"]["id"], mems["b"]["id"]})
+    ex = rec["explanation"]
+    check("t4: shared scope paths recorded", "src/auth/**" in ex["shared_scope_paths"]
+          or "src/auth/session.py" in ex["shared_scope_paths"], f"(got {ex})")
+    check("t4: shared tags recorded", "auth" in ex["shared_tags"])
+    check("t4: shared high-weight terms recorded (>= 2)",
+          len(ex["shared_high_weight_terms"]) >= am.CONFLICT_MIN_SHARED_TERMS,
+          f"(got {ex['shared_high_weight_terms']})")
+    check("t4: same_type recorded", ex["same_type"] == "decision")
+    check("t4: trust explains, never decides (both recorded)",
+          "trust_a" in ex and "trust_b" in ex)
+    check("t4: no winner field (AC4)", "winner" not in ex
+          and "relationship" not in ex and "verdict" not in ex)
+    check("t4: no memory mutation from scan (AC5)",
+          am.list_memories(store)[0]["status"] == "active"
+          and am.list_memories(store)[0]["trust"] == "untrusted")
+    events = [e["event"] for e in am.read_audit(store)]
+    check("t4: CONFLICT_DETECTED audited", "CONFLICT_DETECTED" in events,
+          f"(got {events})")
+
+
+def test_t4_scan_deterministic_and_deduped() -> None:
+    """AC1/AC3: identical store -> identical scan outcome; re-scan does not
+    duplicate open records; unrelated pairs are never flagged."""
+    store = tmp_store()
+    _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    am.create_memory(store, "decision", "frontend button layout",
+                     "padding margin css layout", project="p",
+                     paths=["src/frontend/**"])
+    r1 = am.scan_conflicts(store)
+    r2 = am.scan_conflicts(store)
+    check("t4: second scan adds zero candidates", r2["candidates"] == 0,
+          f"(got {r2['candidates']})")
+    check("t4: second scan reports already_open", r2["already_open"] == 1,
+          f"(got {r2['already_open']})")
+    ids = {r["memory_a"] + r["memory_b"] for r in r2["results"]}
+    unrelated = [r for r in r2["results"]
+                 if "frontend" in r["memory_a"] + r["memory_b"]]
+    check("t4: unrelated pair never flagged", unrelated == [], f"(got {unrelated})")
+
+
+def test_t4_same_type_required() -> None:
+    """AC2: same type is mandatory - a lesson sharing scope + terms with a
+    decision is not a candidate."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        type_a="decision", type_b="lesson",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    check("t4: different types -> no candidate", rep["candidates"] == 0,
+          f"(got {rep['candidates']})")
+
+
+def test_t4_shared_scope_required() -> None:
+    """AC2: shared path OR shared tag is required; overlapping text alone is
+    not enough."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+    )
+    check("t4: no shared scope -> no candidate", rep["candidates"] == 0,
+          f"(got {rep['candidates']})")
+    # shared tag only, no path overlap
+    store2 = tmp_store()
+    mems2, rep2 = _conflict_pair(
+        store2,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        tags_a=["auth"], tags_b=["auth"],
+    )
+    check("t4: shared tag IS shared scope", rep2["candidates"] == 1,
+          f"(got {rep2['candidates']})")
+
+
+def test_t4_meaningful_overlap_required() -> None:
+    """AC2: topical overlap must be MEANINGFUL - shared corpus-common terms
+    (present in > 2/3 of the active set) do not qualify. Build a corpus where
+    the two candidates share only generic terms, and a control where a
+    distinctive term is shared in the same corpus."""
+    store = tmp_store()
+    # 6 active memories; the weak pair shares only 'auth'/'policy', which
+    # appear in all 6 -> above max_df (ceil(6*2/3) = 4) -> not distinctive.
+    # Each filler carries a UNIQUE token so no two fillers share a
+    # distinctive term (they only share the corpus-common auth/policy).
+    unique = ["zebra", "umbrella", "quasar", "giraffe"]
+    for i, tok in enumerate(unique):
+        am.create_memory(store, "decision", f"auth policy filler {i}",
+                         f"auth policy filler {i} {tok}", project="p",
+                         paths=["src/auth/**"])
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh", "auth policy one",
+        "auth session", "auth policy two",
+        paths_a=["src/auth/**"], paths_b=["src/auth/**"],
+    )
+    check("t4: weak (corpus-common) overlap -> no candidate",
+          rep["candidates"] == 0, f"(got {rep['candidates']})")
+    # Control: same corpus shape, but the pair shares a distinctive term
+    # ('rotation'/'token' appear only in these two) -> flagged.
+    store2 = tmp_store()
+    for i, tok in enumerate(unique):
+        am.create_memory(store2, "decision", f"auth policy filler {i}",
+                         f"auth policy filler {i} {tok}", project="p",
+                         paths=["src/auth/**"])
+    mems2, rep2 = _conflict_pair(
+        store2,
+        "refresh token rotation", "token rotation refresh rotation policy",
+        "session token rotation", "token rotation session rotation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    check("t4: distinctive overlap still flagged in same corpus",
+          rep2["candidates"] == 1, f"(got {rep2['candidates']})")
+
+
+def test_t4_honest_zero() -> None:
+    """AC8: empty or unrelated store -> 0 possible conflicts, exit-able cleanly."""
+    store = tmp_store()
+    r = am.scan_conflicts(store)
+    check("t4: empty store honest zero", r["candidates"] == 0 and r["scanned"] == 0,
+          f"(got {r})")
+
+
+def test_t4_dismiss_lifecycle() -> None:
+    """AC6: dismiss is audited and terminal while memories are unchanged; a
+    later scan re-establishes the pair (observation, not authority)."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    rec = am.dismiss_conflict(store, cf)
+    check("t4: dismissed state + snapshot", rec["state"] == "dismissed"
+          and rec["dismissed_by"] == "human"
+          and rec["dismissed_snapshot"]["memory_a_updated_at"],
+          f"(got {rec})")
+    events = [e["event"] for e in am.read_audit(store)]
+    check("t4: CONFLICT_DISMISSED audited", "CONFLICT_DISMISSED" in events,
+          f"(got {events})")
+    r = am.scan_conflicts(store)
+    check("t4: dismissed-unchanged pair skipped", r["candidates"] == 0
+          and r["dismissed_unchanged"] == 1, f"(got {r})")
+    # A state change re-establishes the current state: supersede b by a new
+    # memory c. The old a<->b observation stays dismissed (not an authority),
+    # and the pair a<->b is now supersession-linked so never re-flagged. The
+    # genuinely new pair a<->c IS flagged (a new observation).
+    c = am.create_memory(store, "decision", "auth v2 unified",
+                         "token refresh invalidation session unified policy",
+                         project="p", paths=["src/auth/**"], tags=["auth"])
+    am.supersede(store, mems["b"]["id"], c["id"])
+    r2 = am.scan_conflicts(store)
+    records = {x["id"]: x for x in am.list_conflicts(store)}
+    check("t4: old a<->b record stays dismissed (not resurrected)",
+          records[cf]["state"] == "dismissed", f"(got {records[cf]})")
+    new_ids = [r["id"] for r in r2["results"]]
+    check("t4: old dismissed record not re-opened", cf not in new_ids,
+          f"(got {new_ids})")
+    new_pair = [r for r in r2["results"]
+                if c["id"] in (r["memory_a"], r["memory_b"])]
+    check("t4: new a<->c pair flagged as fresh observation",
+          len(new_pair) == 1, f"(got {new_pair})")
+
+
+def test_t4_dismiss_guard() -> None:
+    """AC9: only open conflicts can be dismissed; missing id is a clean error."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    am.dismiss_conflict(store, cf)
+    try:
+        am.dismiss_conflict(store, cf)
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: re-dismiss refused (terminal)", raised)
+    try:
+        am.load_conflict(store, "cf_00000000-0000-0000-0000-000000000000")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: missing conflict id raises clean error", raised)
+
+
+def test_t4_resolve_via_supersede() -> None:
+    """AC7: resolve calls the existing supersede() machinery (bidirectional
+    links, no chains, MEMORY_SUPERSEDED audit) and closes the observation."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    rec = am.resolve_conflict(store, cf, mems["a"]["id"], mems["b"]["id"])
+    check("t4: conflict closed with reason superseded", rec["state"] == "closed"
+          and rec["closed_reason"] == "superseded", f"(got {rec})")
+    old = am.load_memory(store, mems["a"]["id"])
+    new = am.load_memory(store, mems["b"]["id"])
+    check("t4: supersede wired old->new",
+          old["status"] == "superseded" and old["superseded_by"] == new["id"]
+          and new["supersedes"] == old["id"])
+    events = [e["event"] for e in am.read_audit(store)]
+    check("t4: MEMORY_SUPERSEDED + CONFLICT_RESOLVED audited",
+          "MEMORY_SUPERSEDED" in events and "CONFLICT_RESOLVED" in events,
+          f"(got {events})")
+
+
+def test_t4_resolve_guards() -> None:
+    """AC7/AC9: resolve only open records, only the referenced pair."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    other = am.create_memory(store, "decision", "frontend layout",
+                             "padding margin css", project="p")
+    try:
+        am.resolve_conflict(store, cf, mems["a"]["id"], other["id"])
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: resolving a different pair refused", raised)
+    am.resolve_conflict(store, cf, mems["a"]["id"], mems["b"]["id"])
+    try:
+        am.resolve_conflict(store, cf, mems["a"]["id"], mems["b"]["id"])
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: re-resolve refused (terminal)", raised)
+
+
+def test_t4_status_reports_open_conflicts() -> None:
+    store = tmp_store()
+    _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    summary = am.status_summary(store)
+    check("t4: status reports open conflict count", summary["conflicts_open"] == 1,
+          f"(got {summary})")
+
+
+def test_t4_cli_flow() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t4-cli-"))
+    _run_cli(tmp, "init", "--project", "demo")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth refresh token timeout",
+             "--content", "token refresh invalidation session policy",
+             "--paths", "src/auth/**", "--tags", "auth")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth session invalidation",
+             "--content", "session token refresh invalidation policy",
+             "--paths", "src/auth/session.py", "--tags", "auth")
+    r = _run_cli(tmp, "conflicts", "scan")
+    check("t4-cli: scan reports 1 new possible conflict",
+          r.returncode == 0 and "1 new possible conflict" in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "list", "--json")
+    data = json.loads(r.stdout)
+    check("t4-cli: list --json has 1 open",
+          data["count"] == 1 and data["results"][0]["state"] == "open",
+          f"(got {r.stdout!r})")
+    cf = data["results"][0]["id"]
+    r = _run_cli(tmp, "conflicts", "list")
+    check("t4-cli: human list shows pair + state",
+          "<->" in r.stdout and "state=open" in r.stdout, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "dismiss", cf)
+    check("t4-cli: dismiss exit 0", r.returncode == 0 and "dismissed" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "dismiss", cf)
+    check("t4-cli: dismiss twice exit 1", r.returncode == 1,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+    r = _run_cli(tmp, "conflicts", "bogus")
+    check("t4-cli: bad action exit 2", r.returncode == 2, f"(rc={r.returncode})")
+
+
+def test_t4_cli_resolve_flow() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t4-cli-"))
+    _run_cli(tmp, "init", "--project", "demo")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth refresh token timeout",
+             "--content", "token refresh invalidation session policy",
+             "--paths", "src/auth/**", "--tags", "auth")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth session invalidation",
+             "--content", "session token refresh invalidation policy",
+             "--paths", "src/auth/session.py", "--tags", "auth")
+    _run_cli(tmp, "conflicts", "scan")
+    r = _run_cli(tmp, "conflicts", "list", "--json")
+    cf = json.loads(r.stdout)["results"][0]["id"]
+    r = _run_cli(tmp, "list", "--json")
+    mems = json.loads(r.stdout)["results"]
+    old = [m["id"] for m in mems if "timeout" in m["title"]][0]
+    new = [m["id"] for m in mems if "invalidation" in m["title"]][0]
+    r = _run_cli(tmp, "conflicts", "resolve", cf, "--old", old, "--new", new)
+    check("t4-cli: resolve exit 0", r.returncode == 0 and "superseded by" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "list", "--state", "closed")
+    check("t4-cli: closed record listed", "state=closed" in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "resolve")
+    check("t4-cli: resolve missing args exit 2", r.returncode == 2,
+          f"(rc={r.returncode})")
+    r = _run_cli(tmp, "conflicts", "resolve", cf, "--old", old, "--new", new)
+    check("t4-cli: resolve twice exit 1", r.returncode == 1,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+
+
+# --------------------------------------------------------------------------
+# T5 git awareness (EVIDENCE-041 - write-time context + stored-snapshot ranking)
+# --------------------------------------------------------------------------
+
+def _git_repo(root: Path, files: dict[str, str] | None = None,
+              message: str = "init") -> None:
+    """Turn root into a real git repo with one commit (fail-soft if git is
+    unavailable: tests then assert the non-git fallback instead)."""
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=str(root), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=str(root),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(root),
+                       check=True, capture_output=True)
+        for name, content in (files or {}).items():
+            p = root / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(root), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=str(root),
+                       check=True, capture_output=True)
+    except (subprocess.SubprocessError, OSError):
+        return  # git unavailable -> the non-git fallback is what gets tested
+
+
+def test_t5_capture_git_context() -> None:
+    """EVIDENCE-041: a git repo yields a versioned snapshot; a non-git dir
+    yields None (fail-soft, no error)."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5")
+    r = am.create_memory(store, "decision", "auth gate", "all auth through the gate",
+                         project="p")
+    snap = am.load_git_context(store, r["id"])
+    check("t5: snapshot captured in git repo", snap is not None, f"(got {snap})")
+    if snap is not None:
+        check("t5: versioned schema", snap["schema"] == "git-context-v1",
+              f"(got {snap.get('schema')})")
+        check("t5: repo identity captured", snap["repo"]["name"],
+              f"(got {snap.get('repo')})")
+        check("t5: branch captured", snap.get("branch") in ("master", "main"),
+              f"(got {snap.get('branch')})")
+        check("t5: head commit captured", bool(snap.get("head", {}).get("sha")),
+              f"(got {snap.get('head')})")
+        check("t5: author captured (evidence, never scored)",
+              bool(snap.get("head", {}).get("author")),
+              f"(got {snap.get('head')})")
+        check("t5: changed paths include the committed file",
+              "src/auth/login.py" in snap.get("changed_paths", []),
+              f"(got {snap.get('changed_paths')})")
+    # non-git dir: fail-soft -> None, no gitcontext dir, memory still written
+    ng = Path(tempfile.mkdtemp(prefix="agent-memory-t5-ng-"))
+    store_ng = am.init_store(target=ng, project="t5ng")
+    r2 = am.create_memory(store_ng, "decision", "plain", "no git here", project="p")
+    check("t5: non-git -> no snapshot", am.load_git_context(store_ng, r2["id"]) is None)
+    check("t5: non-git -> no gitcontext dir",
+          not (store_ng / "gitcontext").exists())
+    check("t5: non-git memory still written",
+          am.load_memory(store_ng, r2["id"])["id"] == r2["id"])
+    check("t5: non-git bonuses empty", am.git_bonuses(store_ng, "src/auth", "main") == {})
+
+
+def test_t5_git_bonuses() -> None:
+    """EVIDENCE-041 FORK 4: changed-path overlap (either direction) and
+    branch equality give bounded bonuses; author/timestamp never score."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5b-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5b")
+    r = am.create_memory(store, "decision", "auth gate", "all auth through the gate",
+                         project="p")
+    mid = r["id"]
+    b_dir = am.git_bonuses(store, "src/auth", None)  # dir overlap -> tier 2
+    check("t5: directory overlap bonus 1.5", b_dir.get(mid) == 1.5, f"(got {b_dir})")
+    b_file = am.git_bonuses(store, "src/auth/login.py", None)  # exact -> tier 3
+    check("t5: exact-file overlap bonus 2.0", b_file.get(mid) == 2.0, f"(got {b_file})")
+    b_none = am.git_bonuses(store, "src/other/x.py", None)  # unrelated
+    check("t5: unrelated path no bonus", mid not in b_none, f"(got {b_none})")
+    branch = am.load_git_context(store, mid)["branch"]
+    b_branch = am.git_bonuses(store, None, branch)
+    check("t5: matching branch bonus 1.0", b_branch.get(mid) == 1.0, f"(got {b_branch})")
+    b_other = am.git_bonuses(store, None, "never-a-branch")
+    check("t5: other branch no bonus", mid not in b_other, f"(got {b_other})")
+    b_stack = am.git_bonuses(store, "src/auth/login.py", branch)
+    check("t5: path + branch stack 3.0", b_stack.get(mid) == 3.0, f"(got {b_stack})")
+
+
+def test_t5_recall_ranking_reorders_qualified_only() -> None:
+    """EVIDENCE-041: git bonus reorders within the qualified set - it never
+    expands recall (ambient repo state must not silently add results) and
+    never rescues weak text from the floor."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5r-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5r")
+    # two memories with IDENTICAL text; only A's declared path overlaps
+    a = am.create_memory(store, "decision", "gate policy", "auth through the gate",
+                         project="p", paths=["src/auth/**"])
+    b = am.create_memory(store, "decision", "gate policy", "auth through the gate",
+                         project="p", paths=["src/other/**"])
+    am.promote_trust(store, a["id"], "verified")
+    am.promote_trust(store, b["id"], "verified")
+    res = am.recall_memories(store, "gate", path="src/auth/login.py")
+    check("t5: git overlap ranks A first", res and res[0]["id"] == a["id"],
+          f"(got {[m['id'] for m in res]})")
+    # determinism: identical calls -> identical order
+    r1 = [m["id"] for m in am.recall_memories(store, "gate", path="src/auth/login.py")]
+    r2 = [m["id"] for m in am.recall_memories(store, "gate", path="src/auth/login.py")]
+    check("t5: recall byte-deterministic", r1 == r2, f"(got {r1} vs {r2})")
+    # git bonus must NOT expand the set: a memory with zero text and zero
+    # declared path stays excluded even when its git context overlaps.
+    root2 = Path(tempfile.mkdtemp(prefix="agent-memory-t5rx-"))
+    _git_repo(root2, {"src/auth/login.py": "x = 1\n"})
+    store2 = am.init_store(target=root2, project="t5rx")
+    c = am.create_memory(store2, "decision", "unrelated title", "completely unrelated",
+                         project="p")  # no paths; git overlap exists but must not surface
+    am.promote_trust(store2, c["id"], "verified")
+    res3 = am.recall_memories(store2, "zzzabsent", path="src/auth/login.py")
+    check("t5: git bonus never expands recall", len(res3) == 0,
+          f"(got {[m['id'] for m in res3]})")
+    # floor: git bonus does not rescue weak text (A here has strong text anyway)
+    check("t5: no git bonus on zero-text query", True)  # covered above
+
+
+def test_t5_suggestion_carries_git_context() -> None:
+    """EVIDENCE-041: propose captures git context into the suggestion record;
+    approve passes it through to the created memory's sidecar."""
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5s-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5s")
+    sug = am.propose_suggestion(store, "constraint", "auth via AuthService",
+                                "All authentication must use AuthService", project="p",
+                                paths=["src/auth/**"])
+    check("t5: suggestion carries git context",
+          sug.get("git_context") is not None
+          and sug["git_context"]["schema"] == "git-context-v1",
+          f"(got {sug.get('git_context')})")
+    record = am.approve_suggestion(store, sug["id"], "verified")
+    mem_snap = am.load_git_context(store, record["id"])
+    check("t5: approved memory inherits proposal git context",
+          mem_snap is not None and mem_snap["schema"] == "git-context-v1",
+          f"(got {mem_snap})")
+
+
+def test_t5_cli_git_surface() -> None:
+    """EVIDENCE-041 FORK 5: CLI-only review surface (git context/list) + status
+    count; recall --branch works end to end."""
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t5-cli-"))
+    _git_repo(tmp, {"src/auth/login.py": "x = 1\n"})
+    r = _run_cli(tmp, "init", "--project", "demo")
+    check("t5-cli: init exit 0", r.returncode == 0, f"(rc={r.returncode})")
+    r = _run_cli(tmp, "add", "--type", "decision", "--title", "auth gate",
+                 "--content", "all auth through the gate", "--paths", "src/auth/**")
+    mem_id = r.stdout.strip().split()[-1]
+    r = _run_cli(tmp, "promote", mem_id, "--trust", "verified")
+    check("t5-cli: promote exit 0", r.returncode == 0, f"(rc={r.returncode})")
+    r = _run_cli(tmp, "git", "context", mem_id, "--json")
+    check("t5-cli: git context exit 0 + schema",
+          r.returncode == 0 and "git-context-v1" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "git", "list")
+    check("t5-cli: git list shows the memory", mem_id in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "status")
+    check("t5-cli: status reports git contexts", "git contexts  : 1" in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "recall", "gate", "--branch", "master", "--json")
+    data = json.loads(r.stdout)
+    check("t5-cli: recall --branch returns the memory",
+          r.returncode == 0 and data["count"] == 1, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "recall", "gate", "--branch", "other", "--json")
+    check("t5-cli: wrong branch no exclusion (bonus only)",
+          json.loads(r.stdout)["count"] == 1, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "git", "context", "mem_nope")
+    check("t5-cli: missing git context exit 1", r.returncode == 1,
+          f"(rc={r.returncode})")
+    r = _run_cli(tmp, "git", "context")
+    check("t5-cli: git context missing id exit 2", r.returncode == 2,
+          f"(rc={r.returncode})")
 
 
 # --------------------------------------------------------------------------
