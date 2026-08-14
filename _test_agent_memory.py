@@ -1887,6 +1887,49 @@ def test_t5_cli_git_surface() -> None:
           f"(rc={r.returncode})")
 
 
+def test_t5_git_out_with_open_stdin_pipe() -> None:
+    """EVIDENCE-045 regression: capture_git_context must work when the
+    parent process is an MCP stdio server - i.e. our own stdin is an open
+    pipe that never reaches EOF. Pre-fix, git inherited that pipe and
+    blocked reading it (10s timeout -> silent None); the fix redirects the
+    git subprocess's stdin to DEVNULL. This test spawns a child with
+    stdin=PIPE held OPEN by the parent (never written, never closed, like
+    the MCP protocol stream) and asserts the snapshot is still captured.
+    """
+    root = Path(tempfile.mkdtemp(prefix="agent-memory-t5-pipe-"))
+    _git_repo(root, {"src/auth/login.py": "x = 1\n"})
+    store = am.init_store(target=root, project="t5pipe")
+    am.create_memory(store, "decision", "auth gate", "all auth through the gate",
+                     project="p")
+    am_dir = Path(__file__).resolve().parent
+    child = (
+        "import json, pathlib, sys; "
+        f"sys.path.insert(0, {str(am_dir)!r}); "
+        "import agent_memory as am; "
+        "snap = am.capture_git_context(pathlib.Path(sys.argv[1])); "
+        "print(json.dumps(snap) if snap else 'NONE')"
+    )
+    p = subprocess.Popen(
+        [sys.executable, "-c", child, str(store)],
+        stdin=subprocess.PIPE,  # held open by us below - never closed
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    try:
+        rc = p.wait(timeout=60)  # pre-fix: git blocks -> ~10s -> None
+        out = p.stdout.read() if p.stdout else ""
+        err = p.stderr.read() if p.stderr else ""
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.stdin.close()
+    data = json.loads(out.strip()) if out.strip() else None
+    check("t5-pipe: child exited cleanly", rc == 0, f"(rc={rc}, err={err!r})")
+    check("t5-pipe: capture succeeds with open stdin pipe",
+          data is not None and data.get("schema") == "git-context-v1",
+          f"(got {out.strip()!r})")
+
+
 # --------------------------------------------------------------------------
 
 def main() -> int:
