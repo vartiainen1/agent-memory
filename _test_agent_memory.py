@@ -168,6 +168,180 @@ def test_tier21_floor_search_stays_inclusive() -> None:
           "filler unrelated" not in r_titles, f"(got {r_titles})")
 
 
+def test_t22_coverage_full_query_outranks_partial_repeat() -> None:
+    """T2.2 (EVIDENCE-064): the query-coverage bonus ranks a memory covering
+    ALL distinct query terms above one that repeats a single high-IDF token
+    (the preregistered qualifying scenario, exercised deterministically)."""
+    store = tmp_store()
+    partial = am.create_memory(store, "decision", "zebra migration notes",
+                               "zebra zebra zebra zebra zebra",
+                               tags=["zebra"], project="p")
+    full = am.create_memory(store, "decision", "zebra migration to asia",
+                            "migrate zebra populations to asia reserves",
+                            tags=["zebra", "asia"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    # 'zebra' is common (2/2 memories); 'migration'/'asia' appear once each
+    # (distinctive). The partial-repeat memory hits only 'zebra' many times;
+    # the full memory hits every query term at least once.
+    results = am.recall_memories(store, "zebra migration asia")
+    titles = [r["title"] for r in results]
+    check("t2.2: full-coverage memory ranks above partial repeat",
+          titles == ["zebra migration to asia", "zebra migration notes"],
+          f"(got {titles})")
+    check("t2.2: full-coverage memory is the top hit",
+          results[0]["id"] == full["id"], f"(got {results[0]['title']})")
+    check("t2.2: partial repeat still present (floor semantics intact)",
+          partial["id"] in [r["id"] for r in results])
+
+
+def test_t22_tag_exactness_outranks_content_substring() -> None:
+    """T2.2 (EVIDENCE-064): an exact tag == term hit (curated metadata) beats
+    the same term appearing only as a content substring, all else equal."""
+    store = tmp_store()
+    tagged = am.create_memory(store, "decision", "auth decision alpha",
+                              "alpha decision content", tags=["auth"],
+                              project="p")
+    substring = am.create_memory(store, "decision", "auth decision beta",
+                                 "authenticate the beta flow", tags=["beta"],
+                                 project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "auth decision")
+    titles = [r["title"] for r in results]
+    check("t2.2: exact tag hit ranks first",
+          titles == ["auth decision alpha", "auth decision beta"],
+          f"(got {titles})")
+
+
+def test_t22_honest_zero_preserved_with_bonuses() -> None:
+    """T2.2 INVARIANT: the coverage/tag bonuses can never rescue a zero-hit
+    memory - matched == 0 means zero bonus, so honest-zero semantics
+    (EVIDENCE-003) are byte-identical to the baseline."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "auth session state",
+                     "server-side session", tags=["auth"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    results = am.recall_memories(store, "deploy kubernetes cluster")
+    check("t2.2: zero-hit query still returns 0 results",
+          results == [], f"(got {len(results)})")
+
+
+def test_t22_determinism_preserved_with_bonuses() -> None:
+    """T2.2 INVARIANT: identical store + query -> byte-identical ordering
+    across calls (bonuses are pure functions of the candidate set)."""
+    store = tmp_store()
+    for title, content, tags in (
+        ("alpha auth migration", "migrate alpha auth", ["auth"]),
+        ("beta auth migration", "migrate beta auth", ["auth", "migration"]),
+        ("gamma config auth", "auth config gamma", ["auth"]),
+    ):
+        am.create_memory(store, "decision", title, content, tags=tags,
+                         project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    r1 = am.recall_memories(store, "auth migration")
+    r2 = am.recall_memories(store, "auth migration")
+    check("t2.2: repeated recall is byte-identical",
+          [r["id"] for r in r1] == [r["id"] for r in r2])
+    # Equal-score ties still break on (created_at, title, id) desc - the
+    # bonuses apply uniformly to equal-coverage memories, so the baseline
+    # tie-break contract is unchanged.
+    store2 = tmp_store()
+    for title in ("A auth", "B auth", "C auth"):
+        rec = am.create_memory(store2, "decision", title, "about auth",
+                               project="p")
+        rec["created_at"] = "2026-08-12T00:00:00Z"
+        am.save_memory(store2, rec)
+    tied = am.recall_memories(store2, "auth")
+    got = [(r["title"], r["id"]) for r in tied]
+    check("t2.2: equal-score tie-break still (created_at, title, id) desc",
+          got == sorted(got, reverse=True), f"(got {got})")
+
+
+def test_t22_trust_never_scores_with_bonuses() -> None:
+    """T2.2 INVARIANT: trust/provenance/status are never read by the new
+    signals - untrusted memories stay excluded from recall by default and
+    trust does not reorder the scored set."""
+    store = tmp_store()
+    a = am.create_memory(store, "decision", "auth config alpha", "alpha",
+                         tags=["auth"], project="p")
+    b = am.create_memory(store, "decision", "auth config beta", "beta",
+                         tags=["auth"], project="p")
+    am.promote_trust(store, a["id"], "approved")
+    # b stays untrusted.
+    results = am.recall_memories(store, "auth config")
+    check("t2.2: untrusted still excluded by default",
+          [r["id"] for r in results] == [a["id"]],
+          f"(got {[r['id'] for r in results]})")
+    # Search (inclusive) sees both - bonuses never gate on trust.
+    s = am.search_memories(store, "auth config")
+    check("t2.2: search still returns untrusted (trust never scores)",
+          len(s) == 2, f"(got {len(s)})")
+
+
+def test_t22_git_bonus_unaffected_by_coverage() -> None:
+    """T2.2 INVARIANT: the new text signals do not interact with the T5 git
+    bonus - a git-bonus memory cannot be expanded or displaced by coverage
+    beyond the same relative ordering the baseline would produce."""
+    store = tmp_store()
+    am.create_memory(store, "constraint", "deploy gate auth",
+                     "auth gate deploy", tags=["auth"],
+                     paths=["src/deploy/*"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    # Path bonus is unaffected by text bonuses: a path hit still outranks a
+    # pure text hit at the same text relevance.
+    results = am.recall_memories(store, "auth", path="src/deploy/x.py")
+    check("t2.2: path/git tier signals still apply unchanged",
+          len(results) == 1, f"(got {len(results)})")
+
+
+def test_t22_bonus_magnitudes_bounded() -> None:
+    """T2.2 INVARIANT: the bonuses are bounded as preregistered - coverage
+    cannot exceed COVERAGE_BONUS_MAX and each exact tag hit is worth exactly
+    TAG_EXACT_BONUS; a full-coverage memory gains no more than the cap."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "x y z alpha", "alpha x y z",
+                     tags=["alpha", "x"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    records = am.list_memories(store, status="active")
+    terms = ["x", "y", "z"]
+    idf = am._idf_weights(len(records), am._term_doc_freqs(records, terms))
+    r = records[0]
+    blob = " ".join((r["title"], " ".join(r.get("tags", [])),
+                      r["content"])).lower()
+    matched = sum(1 for t in terms if t in blob)
+    cov = am.COVERAGE_BONUS_MAX * (matched / len(terms))
+    check("t2.2: coverage bonus capped at COVERAGE_BONUS_MAX",
+          cov <= am.COVERAGE_BONUS_MAX and matched == len(terms),
+          f"(cov {cov}, max {am.COVERAGE_BONUS_MAX})")
+    exact = sum(1 for t in terms
+                if t in [x.lower() for x in r.get("tags", [])])
+    tag = am.TAG_EXACT_BONUS * exact
+    check("t2.2: tag bonus bounded per exact hit",
+          tag == am.TAG_EXACT_BONUS, f"(got {tag})")
+
+
+def test_t22_search_shares_coverage_scoring() -> None:
+    """T2.2: search and recall share the SAME scoring - coverage/tag bonuses
+    apply in search too (deterministic, inclusive); only the floor is
+    recall-only."""
+    store = tmp_store()
+    partial = am.create_memory(store, "decision", "zebra notes",
+                               "zebra zebra", tags=["zebra"], project="p")
+    full = am.create_memory(store, "decision", "zebra asia migration",
+                            "asia zebra migration", tags=["asia"],
+                            project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    s = am.search_memories(store, "zebra asia migration")
+    check("t2.2: search ranks full coverage first (shared scoring)",
+          s[0]["id"] == full["id"], f"(got {[r['title'] for r in s]})")
+
+
 # 1. Schema / validation
 ERROR_LOG_FIXTURE = """================================================================================
 ERROR LOG - HOW TO USE

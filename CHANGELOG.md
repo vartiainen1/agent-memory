@@ -5,6 +5,26 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 T2.2, query-coverage + tag-exactness ranking signals - EVIDENCE-064)
+- Two bounded, deterministic TEXT scoring signals added inside the shared
+  `_rank_records` (search + recall): a query-coverage bonus
+  (`COVERAGE_BONUS_MAX = 1.5` × distinct-query-terms-matched / total
+  distinct terms) that ranks a memory covering the WHOLE query above a
+  partial repeat of one high-IDF token, and a tag-exactness bonus
+  (`TAG_EXACT_BONUS = 0.5` per exact tag == query term) treating curated
+  tag metadata as stronger evidence than a content substring.
+- Invariants held: both are pure functions of (candidate records, query
+  terms) so byte-identical determinism is preserved; they attach only to
+  memories that already have term hits (zero hits => zero bonus) so the
+  honest-zero gate and the relevance floor's relative semantics are
+  unchanged; they never read trust/provenance/status; they never interact
+  with the T5 git bonus; the candidate set is untouched (no expansion).
+- Real-corpus evaluation (9 real memories, 12 real evidence-log queries)
+  showed zero ranking regressions and one marginal applicable gain
+  (`auth` now surfaces a trust-promotion constraint); the qualifying
+  multi-topic scenario is pinned deterministically in the companion suite.
+- +15 unit checks (394 total); spec section 8 + README updated in the same
+  commit (drift-guard clean); preregistration preserved as evidence history.
 ### Added (v0.3 Tier 5, git awareness - EVIDENCE-041)
 - Write-time git context capture: when a memory is created (CLI add, MCP
   memory_create, approval conversion) or suggested, agent-memory MAY

@@ -144,6 +144,16 @@ unless they match `--path` (explicit intent). `search` stays
 inclusive — operators see everything that matches; agents get only
 confident context.
 
+Two **bounded deterministic text signals** (v0.3 T2.2, EVIDENCE-064)
+sharpen the ranking without changing the candidate set: a query-coverage
+bonus (`COVERAGE_BONUS_MAX = 1.5`) rewards a memory that covers the whole
+query over a partial repeat of one token, and a tag-exactness bonus
+(`TAG_EXACT_BONUS = 0.5` per exact tag == term) treats curated tags as
+stronger evidence than a content substring. Both are pure functions of
+(candidate records, query terms) — no LLM, no network, no live git — and
+attach only to memories that already match (zero hits ⇒ zero bonus), so
+honest-zero results and the relevance floor are unchanged.
+
 `--path` is a **tiered ranking signal**, not an auto-win (v0.3 T2.1): a
 memory whose path pattern covers the touched file gets a bonus by
 specificity — exact file (10) > bare directory (6) > glob/prefix (3) —
@@ -273,7 +283,7 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (381 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (394 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (173 checks)
 python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (71 checks)
 ```

@@ -1371,6 +1371,18 @@ def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str 
 PHRASE_BONUS = 2.0  # per contiguous adjacent query pair found in a field
 SCORE_FLOOR_RATIO = 0.25  # recall-only: drop text scores below ratio x top text score
 
+# T2.2 bounded deterministic signals (EVIDENCE-064, preregistered as
+# prospective T2.2): query-coverage and tag-exactness bonuses added to the
+# TEXT score inside _rank_records. Both are pure functions of (candidate
+# records, query terms) - no wall-clock, no network, no live git, no LLM.
+# They are bounded (coverage <= COVERAGE_BONUS_MAX, tag <= TAG_EXACT_BONUS
+# per exact hit), never touch trust/provenance/status, never interact with
+# the T5 git bonus, and can never rescue a zero-hit memory (matched == 0 and
+# exact == 0 when the memory has no term hits, so the honest-zero gate is
+# untouched).
+COVERAGE_BONUS_MAX = 1.5  # scaled by (# distinct query terms matched / # terms)
+TAG_EXACT_BONUS = 0.5  # per exact tag == query-term match (curated metadata)
+
 
 def _term_doc_freqs(records: list[dict], terms: list[str]) -> dict[str, int]:
     """df(t): number of candidate records whose title/tags/content contain t."""
@@ -1416,17 +1428,20 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
     """Deterministic relevance ranking shared by search and recall.
 
     Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
-    a phrase bonus; + a TIERED path bonus when --path matches (T2.1,
-    EVIDENCE-031): exact file (10) > directory (6) > glob (3) > none (0);
-    + a T5 git bonus from STORED snapshots (EVIDENCE-041) - a bounded,
-    deterministic boost for memories whose captured git changed-paths
-    overlap the recall --path argument and/or whose captured branch equals
-    the recall --branch argument. The tier/branch signals are ranking
-    signals, not auto-wins - text relevance still matters. Scores round to
-    6 decimals for cross-platform-stable ordering; exact ties break on
-    (created_at, title, id) desc. Honest zero results: score <= 0 (no term
-    hits, no path match, no git bonus) is excluded - recall never invents
-    context (EVIDENCE-003).
+    a phrase bonus; + a T2.2 query-coverage bonus (COVERAGE_BONUS_MAX,
+    scaled by distinct-term coverage) and a T2.2 tag-exactness bonus
+    (TAG_EXACT_BONUS per exact tag == term) - both bounded, corpus-pure
+    text signals (EVIDENCE-064); + a TIERED path bonus when --path matches
+    (T2.1, EVIDENCE-031): exact file (10) > directory (6) > glob (3) >
+    none (0); + a T5 git bonus from STORED snapshots (EVIDENCE-041) - a
+    bounded, deterministic boost for memories whose captured git
+    changed-paths overlap the recall --path argument and/or whose captured
+    branch equals the recall --branch argument. The tier/branch signals
+    are ranking signals, not auto-wins - text relevance still matters.
+    Scores round to 6 decimals for cross-platform-stable ordering; exact
+    ties break on (created_at, title, id) desc. Honest zero results:
+    score <= 0 (no term hits, no path match, no git bonus) is excluded -
+    recall never invents context (EVIDENCE-003).
 
     floor_ratio (Tier 2.1, EVIDENCE-010/015): when set, a memory's TEXT score
     must be >= floor_ratio x the best text score in the candidate set, UNLESS
@@ -1444,6 +1459,22 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
             3.0 * _field_score(r.get("title", ""), terms, idf)
             + 2.0 * _field_score(tags_text, terms, idf)
             + 1.0 * _field_score(r.get("content", ""), terms, idf), 6)
+        # T2.2 bounded text signals (EVIDENCE-064): query-coverage bonus
+        # rewards a memory hitting ALL distinct query terms over a repeated
+        # partial token; tag-exactness rewards an exact tag == term hit
+        # (curated metadata is stronger evidence than a content substring).
+        # Both attach ONLY when the memory already has term hits (matched
+        # counts hits; zero hits => zero bonus), keeping the honest-zero
+        # gate and the relevance floor's relative semantics intact.
+        if terms:
+            blob = " ".join((r.get("title", ""), tags_text,
+                             r.get("content", ""))).lower()
+            matched = sum(1 for t in terms if t in blob)
+            text += COVERAGE_BONUS_MAX * (matched / len(terms))
+            tag_hits = sum(1 for t in terms
+                           if t in [x.lower() for x in r.get("tags", [])])
+            text += TAG_EXACT_BONUS * tag_hits
+            text = round(text, 6)
         path_bonus = 0.0
         if path:
             for pat in r.get("paths", []):
