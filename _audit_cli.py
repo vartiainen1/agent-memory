@@ -672,6 +672,131 @@ def audit_suggestions():
        st["suggestions_pending"] == 0, json.dumps(st)[:200])
 
 
+def audit_conflicts():
+    """T4 (EVIDENCE-038): narrow possible-conflict detection, human-only
+    review (dismiss / resolve via existing supersede), audited lifecycle."""
+    p = Project()
+    p.init()
+    r = p.run("conflicts", "scan")
+    ok("conflicts: empty store scan -> 0 candidates exit 0",
+       r.returncode == 0 and "0 new possible conflict" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    r = p.run("conflicts", "list")
+    ok("conflicts: empty list -> 0 results exit 0",
+       r.returncode == 0 and "0 results" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+
+    # Narrow candidate: same type + shared path + meaningful overlap.
+    p.add("decision", "auth refresh token timeout",
+          "token refresh invalidation session policy",
+          "--paths", "src/auth/**", "--tags", "auth")
+    p.add("decision", "auth session invalidation",
+          "session token refresh invalidation policy",
+          "--paths", "src/auth/session.py", "--tags", "auth")
+    p.add("decision", "frontend button layout", "padding margin css layout",
+          "--paths", "src/frontend/**")  # unrelated scope, never flagged
+    r = p.run("conflicts", "scan")
+    ok("conflicts: scan finds exactly the overlapping pair",
+       r.returncode == 0 and "1 new possible conflict" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    r = p.run("conflicts", "scan")
+    ok("conflicts: re-scan dedupes (0 new, 1 already open)",
+       r.returncode == 0 and "0 new possible conflict" in r.stdout
+       and "1 already open" in r.stdout, f"out={r.stdout!r}")
+    r = p.run("conflicts", "list", "--json")
+    data = json.loads(r.stdout)
+    ok("conflicts: list --json 1 open record with explanation",
+       data["count"] == 1 and data["results"][0]["state"] == "open"
+       and "shared_high_weight_terms" in data["results"][0]["explanation"]
+       and "winner" not in data["results"][0]["explanation"],
+       f"out={r.stdout[:300]!r}")
+    cf = data["results"][0]["id"]
+    ok("conflicts: id space is cf_", cf.startswith("cf_"), cf)
+
+    # Dismiss path: terminal while memories unchanged.
+    r = p.run("conflicts", "dismiss", cf)
+    ok("conflicts: dismiss exit 0", r.returncode == 0 and "dismissed" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    r = p.run("conflicts", "dismiss", cf)
+    ok("conflicts: re-dismiss -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode} err={r.stderr!r}")
+    r = p.run("conflicts", "scan")
+    ok("conflicts: dismissed-unchanged pair skipped by scan",
+       r.returncode == 0 and "1 dismissed-unchanged skipped" in r.stdout,
+       f"out={r.stdout!r}")
+    r = p.run("conflicts", "list", "--state", "dismissed")
+    ok("conflicts: dismissed record listed by state filter",
+       "state=dismissed" in r.stdout, f"out={r.stdout!r}")
+
+    # Resolve path: reuses the existing supersede() machinery.
+    p2 = Project()
+    p2.init()
+    p2.add("decision", "auth refresh token timeout",
+           "token refresh invalidation session policy",
+           "--paths", "src/auth/**", "--tags", "auth")
+    p2.add("decision", "auth session invalidation",
+           "session token refresh invalidation policy",
+           "--paths", "src/auth/session.py", "--tags", "auth")
+    p2.run("conflicts", "scan")
+    r = p2.run("conflicts", "list", "--json")
+    cf2 = json.loads(r.stdout)["results"][0]["id"]
+    ids = p2.all_ids()
+    old = ids[0]
+    new = ids[1]
+    r = p2.run("conflicts", "resolve", cf2, "--old", old, "--new", new)
+    ok("conflicts: resolve exit 0 + supersede message",
+       r.returncode == 0 and "superseded by" in r.stdout,
+       f"rc={r.returncode} out={r.stdout!r}")
+    o = json.loads(p2.run("show", old, "--json").stdout)
+    n = json.loads(p2.run("show", new, "--json").stdout)
+    ok("conflicts: resolve wired supersession links",
+       o["status"] == "superseded" and o["superseded_by"] == new
+       and n["supersedes"] == old, f"old={o['status']} new={n['supersedes']}")
+    r = p2.run("conflicts", "resolve", cf2, "--old", old, "--new", new)
+    ok("conflicts: re-resolve -> exit 1 (terminal)", r.returncode == 1,
+       f"rc={r.returncode}")
+
+    # Guards and errors.
+    p3 = Project()
+    p3.init()
+    p3.add("decision", "auth refresh token timeout",
+           "token refresh invalidation session policy",
+           "--paths", "src/auth/**", "--tags", "auth")
+    p3.add("decision", "auth session invalidation",
+           "session token refresh invalidation policy",
+           "--paths", "src/auth/session.py", "--tags", "auth")
+    p3.run("conflicts", "scan")
+    r = p3.run("conflicts", "list", "--json")
+    cf3 = json.loads(r.stdout)["results"][0]["id"]
+    r = p3.run("conflicts", "resolve")
+    ok("conflicts: resolve missing args -> exit 2", r.returncode == 2,
+       f"rc={r.returncode}")
+    r = p3.run("conflicts", "resolve", cf3, "--old", "mem_x", "--new", "mem_y")
+    ok("conflicts: resolve missing memories -> exit 1", r.returncode == 1,
+       f"rc={r.returncode}")
+    r = p3.run("conflicts", "dismiss", "cf_00000000-0000-0000-0000-000000000000")
+    ok("conflicts: dismiss missing id -> exit 1 clean message",
+       r.returncode == 1 and "no conflict record" in (r.stderr or ""),
+       f"rc={r.returncode} err={r.stderr!r}")
+    r = p3.run("conflicts", "bogus")
+    ok("conflicts: bad action -> exit 2", r.returncode == 2, f"rc={r.returncode}")
+
+    events = p.audit_events()
+    ok("conflicts: CONFLICT_DETECTED + CONFLICT_DISMISSED audited",
+       "CONFLICT_DETECTED" in events and "CONFLICT_DISMISSED" in events,
+       str(events))
+    events2 = p2.audit_events()
+    ok("conflicts: MEMORY_SUPERSEDED + CONFLICT_RESOLVED audited on resolve",
+       "MEMORY_SUPERSEDED" in events2 and "CONFLICT_RESOLVED" in events2,
+       str(events2))
+    st = json.loads(p2.run("status", "--json").stdout)
+    ok("conflicts: status reports open conflict count 0 after resolve",
+       st["conflicts_open"] == 0, json.dumps(st)[:200])
+    st1 = json.loads(p.run("status", "--json").stdout)
+    ok("conflicts: status reports open count on dismissed project",
+       st1["conflicts_open"] == 0, json.dumps(st1)[:200])
+
+
 # ==========================================================================
 # not-initialized across commands + project discovery + corrupt config
 # ==========================================================================
@@ -800,6 +925,7 @@ def main() -> int:
     audit_delete()
     audit_status()
     audit_suggestions()
+    audit_conflicts()
     audit_discovery_errors()
     audit_json_errors_and_meta()
     cleanup_all()

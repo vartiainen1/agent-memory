@@ -19,6 +19,7 @@ Contract: V0.1_SPEC.md in this repo. Run from a project folder:
     python agent_memory.py supersede <old_id> <new_id>
     python agent_memory.py delete <mem_id> [--purge]
     python agent_memory.py suggestions list|approve <sug_id> --trust verified|approved|reject <sug_id>
+    python agent_memory.py conflicts scan|list|dismiss <conflict_id>|resolve <conflict_id> --old <id> --new <id>
     python agent_memory.py status [--json]
 
 Exit codes: 0 = success, 1 = runtime error, 2 = usage error.
@@ -61,6 +62,26 @@ AUDIT_FILE = "audit.jsonl"
 SUGGESTION_PREFIX = "sug_"
 SUGGESTION_SUBDIR = "suggestions"
 SUGGESTION_STATES = ("pending", "approved", "rejected")
+
+# T4 possible-conflict detection (v0.3 Tier 4, EVIDENCE-038): a conflict
+# record is an OBSERVATION, not a memory and not an authority. It lives in
+# .agent/conflicts/ (separate subdir, separate id space cf_), carries an
+# explanation (WHY the pair was surfaced - shared scope, shared high-weight
+# terms, type, trust, age) and NEVER a winner/relationship field. Only a
+# human can dismiss (audited, terminal while memories are unchanged) or
+# resolve via the existing supersede() machinery. No MCP surface.
+CONFLICT_PREFIX = "cf_"
+CONFLICT_SUBDIR = "conflicts"
+CONFLICT_STATES = ("open", "dismissed", "closed")
+# Narrow detection (FORK 1): same type + shared scope + meaningful topical
+# overlap. "Meaningful" = at least this many shared terms, where a shared
+# term is DISTINCTIVE: it appears in at most ~half the active corpus
+# (df <= ceil(n / 2), floored at 2). Corpus-relative and deterministic -
+# a term that appears in most memories carries no discrimination.
+CONFLICT_MIN_SHARED_TERMS = 2
+CONFLICT_MAX_DF_NUMER = 1
+CONFLICT_MAX_DF_DENOM = 2
+CONFLICT_TERM_MIN_LEN = 3
 
 MEMORY_TYPES = ("decision", "error", "lesson", "constraint", "architecture", "pattern")
 PROVENANCES = ("human", "agent", "import", "system", "external")
@@ -149,6 +170,11 @@ def new_id() -> str:
 def new_suggestion_id() -> str:
     """sug_<uuid4> (T3 - distinct id space from memories)."""
     return SUGGESTION_PREFIX + str(uuid.uuid4())
+
+
+def new_conflict_id() -> str:
+    """cf_<uuid4> (T4 - distinct id space from memories and suggestions)."""
+    return CONFLICT_PREFIX + str(uuid.uuid4())
 
 
 def shannon_entropy(text: str) -> float:
@@ -388,6 +414,7 @@ def init_store(target: pathlib.Path | None = None, project: str | None = None, f
     for t in MEMORY_TYPES:
         (store / MEMORY_SUBDIR / t).mkdir(parents=True, exist_ok=True)
     (store / SUGGESTION_SUBDIR).mkdir(parents=True, exist_ok=True)
+    (store / CONFLICT_SUBDIR).mkdir(parents=True, exist_ok=True)
     project_name = project or root.name
     config = {"project": project_name, "recall_limit": DEFAULT_RECALL_LIMIT, "include_untrusted": False}
     _write_text_utf8(store / CONFIG_FILE, _dump_toml(config))
@@ -803,6 +830,309 @@ def reject_suggestion(store: pathlib.Path, sug_id: str, actor: str = "human") ->
     return sug
 
 
+# --------------------------------------------------------------------------
+# T4 possible-conflict detection (v0.3 Tier 4, EVIDENCE-038)
+# --------------------------------------------------------------------------
+# A conflict record is an OBSERVATION, not an authority: it surfaces pairs
+# that deserve human attention (same type + shared scope + meaningful
+# topical overlap). It never decides a winner, never writes memory records,
+# and only a human can dismiss it (audited, terminal while memories are
+# unchanged) or resolve it via the existing supersede() machinery. Scan is
+# on-demand and deterministic; there is NO write-time enforcement.
+
+
+def _conflict_term_set(record: dict) -> set[str]:
+    """Lowercased tokens (len >= 3) from title + tags + content, for IDF."""
+    blob = " ".join((
+        record.get("title", ""),
+        " ".join(record.get("tags", [])),
+        record.get("content", ""),
+    )).lower()
+    return {t for t in re.split(r"[^a-z0-9]+", blob) if len(t) >= CONFLICT_TERM_MIN_LEN}
+
+
+def _paths_share_scope(a: list[str], b: list[str]) -> bool:
+    """True if any pattern in a matches any pattern in b (either direction)."""
+    for pa in a:
+        for pb in b:
+            if path_tier(pa, pb) > 0 or path_tier(pb, pa) > 0:
+                return True
+    return False
+
+
+def _tags_share_scope(a: list[str], b: list[str]) -> bool:
+    return bool(set(a) & set(b))
+
+
+def _conflict_explanation(a: dict, b: dict,
+                          shared_terms: list[str], idf: dict[str, float]) -> dict:
+    """Deterministic WHY record - explanation only, never a verdict.
+
+    EVIDENCE-038 FORK 2: NO winner field, NO relationship field - the
+    detector cannot establish either. Trust and age explain the candidate;
+    they never decide which memory (if either) is correct.
+    """
+    shared_paths = [p for p in a.get("paths", []) if any(
+        path_tier(p, q) > 0 or path_tier(q, p) > 0 for q in b.get("paths", []))]
+    shared_tags = sorted(set(a.get("tags", [])) & set(b.get("tags", [])))
+    return {
+        "shared_scope_paths": shared_paths,
+        "shared_tags": shared_tags,
+        "shared_high_weight_terms": sorted(shared_terms),
+        "overlap_score": round(sum(idf[t] for t in shared_terms), 6),
+        "same_type": a["type"],
+        "trust_a": a["trust"],
+        "trust_b": b["trust"],
+        "age_a": a["created_at"],
+        "age_b": b["created_at"],
+        "reason": "overlapping scope + topical similarity",
+    }
+
+
+def scan_conflicts(store: pathlib.Path, actor: str = "human") -> dict:
+    """On-demand deterministic scan: find pairs that deserve human review.
+
+    Returns a report dict (never writes memory records). For each new
+    candidate pair it writes one .agent/conflicts/cf_<uuid>.json record and
+    audits CONFLICT_DETECTED. Narrow (EVIDENCE-038 FORK 1): same type +
+    shared scope (path pattern overlap OR shared tag) + meaningful topical
+    overlap (>= CONFLICT_MIN_SHARED_TERMS terms with idf >=
+    CONFLICT_IDF_FLOOR). Ineligible: already supersession-linked, identical
+    ids, or previously dismissed AND both memories unchanged. Dismissed
+    pairs whose underlying memories have changed are re-eligible (a
+    conflict is an observation, not an authority - lifecycle rule).
+    Deterministic: pair iteration in (id) order, stable scoring, stable
+    output ordering.
+    """
+    folder = store / CONFLICT_SUBDIR
+    folder.mkdir(parents=True, exist_ok=True)
+    active = [r for r in list_memories(store) if r.get("status") == "active"]
+    active.sort(key=lambda r: r["id"])
+    existing = _load_conflicts(store)
+    open_pairs: set[tuple[str, str]] = set()
+    dismissed_unchanged: set[tuple[str, str]] = set()
+    state_closed: list[dict] = []
+    for rec in existing:
+        pair = tuple(sorted((rec["memory_a"], rec["memory_b"])))
+        if rec.get("state") != "open":
+            if rec.get("state") == "dismissed":
+                try:
+                    a = load_memory(store, rec["memory_a"])
+                    b = load_memory(store, rec["memory_b"])
+                except AgentMemoryError:
+                    continue  # a memory was purged; observation is stale, re-eligible
+                snap = rec.get("dismissed_snapshot", {})
+                if (a.get("updated_at") == snap.get("memory_a_updated_at")
+                        and b.get("updated_at") == snap.get("memory_b_updated_at")):
+                    dismissed_unchanged.add(pair)
+            continue
+        # Open record: re-establish the CURRENT state - close the observation
+        # if the pair is now supersession-linked or either memory is no longer
+        # active (deleted/purged). A conflict is an observation, not authority.
+        try:
+            a = load_memory(store, rec["memory_a"])
+            b = load_memory(store, rec["memory_b"])
+        except AgentMemoryError:
+            state_closed.append((rec, "memory_removed"))
+            continue
+        if a.get("status") != "active" or b.get("status") != "active":
+            state_closed.append((rec, "memory_no_longer_active"))
+            continue
+        if _supersession_linked(a, b):
+            state_closed.append((rec, "pair_superseded"))
+            continue
+        open_pairs.add(pair)
+    for rec, reason in state_closed:
+        rec["state"] = "closed"
+        rec["closed_at"] = now_utc()
+        rec["closed_by"] = actor
+        rec["closed_reason"] = reason
+        _write_text_utf8(store / CONFLICT_SUBDIR / f"{rec['id']}.json",
+                         json.dumps(rec, indent=2, ensure_ascii=False) + "\n")
+        append_audit(store, "CONFLICT_CLOSED", None, actor, {
+            "conflict_id": rec["id"],
+            "memory_a": rec["memory_a"],
+            "memory_b": rec["memory_b"],
+            "reason": reason,
+        })
+
+    all_terms = _all_terms(active)
+    df = _term_doc_freqs(active, all_terms)
+    idf = _idf_weights(len(active), df)
+    max_df = max(2, (len(active) * CONFLICT_MAX_DF_NUMER + CONFLICT_MAX_DF_DENOM - 1)
+                 // CONFLICT_MAX_DF_DENOM)
+    created: list[dict] = []
+    for i in range(len(active)):
+        for j in range(i + 1, len(active)):
+            a, b = active[i], active[j]
+            pair = (a["id"], b["id"])
+            if pair in open_pairs or pair in dismissed_unchanged:
+                continue
+            if _supersession_linked(a, b):
+                continue
+            if a["type"] != b["type"]:
+                continue  # narrow: same type required (FORK 1)
+            if not (_paths_share_scope(a.get("paths", []), b.get("paths", []))
+                    or _tags_share_scope(a.get("tags", []), b.get("tags", []))):
+                continue  # narrow: shared scope required
+            terms_a = _conflict_term_set(a)
+            terms_b = _conflict_term_set(b)
+            shared = [t for t in all_terms if t in terms_a and t in terms_b
+                      and df[t] <= max_df]
+            if len(shared) < CONFLICT_MIN_SHARED_TERMS:
+                continue  # narrow: meaningful topical overlap required
+            record = {
+                "format_version": FORMAT_VERSION,
+                "id": new_conflict_id(),
+                "state": "open",
+                "memory_a": a["id"],
+                "memory_b": b["id"],
+                "created_at": now_utc(),
+                "dismissed_at": None,
+                "dismissed_by": None,
+                "dismissed_snapshot": None,
+                "closed_at": None,
+                "closed_by": None,
+                "closed_reason": None,
+                "explanation": _conflict_explanation(a, b, shared, idf),
+            }
+            _write_text_utf8(folder / f"{record['id']}.json",
+                             json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+            append_audit(store, "CONFLICT_DETECTED", None, actor, {
+                "conflict_id": record["id"],
+                "memory_a": a["id"],
+                "memory_b": b["id"],
+                "type": a["type"],
+            })
+            created.append(record)
+    created.sort(key=lambda r: (r["created_at"], r["id"]))
+    return {
+        "scanned": len(active),
+        "candidates": len(created),
+        "already_open": len(open_pairs),
+        "dismissed_unchanged": len(dismissed_unchanged),
+        "closed_stale": len(state_closed),
+        "results": created,
+    }
+
+
+def _all_terms(records: list[dict]) -> list[str]:
+    """Deterministic sorted union of all memory term sets (df denominator)."""
+    terms: set[str] = set()
+    for r in records:
+        terms |= _conflict_term_set(r)
+    return sorted(terms)
+
+
+def _supersession_linked(a: dict, b: dict) -> bool:
+    return (a.get("supersedes") == b.get("id") or b.get("supersedes") == a.get("id")
+            or a.get("superseded_by") == b.get("id") or b.get("superseded_by") == a.get("id"))
+
+
+def _load_conflicts(store: pathlib.Path) -> list[dict]:
+    """All conflict records, sorted by (created_at, id) for determinism."""
+    folder = store / CONFLICT_SUBDIR
+    records: list[dict] = []
+    if folder.is_dir():
+        for f in folder.glob("*.json"):
+            try:
+                records.append(json.loads(f.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError) as exc:
+                raise AgentMemoryError(f"corrupt conflict file {f}: {exc}") from exc
+    records.sort(key=lambda r: (r.get("created_at", ""), r.get("id", "")))
+    return records
+
+
+def list_conflicts(store: pathlib.Path, state: str | None = None) -> list[dict]:
+    """List conflict records, newest first (state filter optional)."""
+    records = _load_conflicts(store)
+    if state:
+        records = [r for r in records if r.get("state") == state]
+    return list(reversed(records))
+
+
+def load_conflict(store: pathlib.Path, conflict_id: str) -> dict:
+    """Load one conflict record by id."""
+    path = store / CONFLICT_SUBDIR / f"{conflict_id}.json"
+    if not path.exists():
+        raise AgentMemoryError(f"no conflict record with id {conflict_id}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise AgentMemoryError(f"corrupt conflict file {path}: {exc}") from exc
+
+
+def dismiss_conflict(store: pathlib.Path, conflict_id: str, actor: str = "human") -> dict:
+    """Human-only, audited dismissal of an open conflict observation.
+
+    Terminal for the pair while the underlying memories are unchanged: the
+    record snapshots both memories' updated_at, and a later scan will not
+    re-flag a dismissed pair unless either memory changed (EVIDENCE-038
+    lifecycle rule - a conflict is an observation, not an authority).
+    """
+    record = load_conflict(store, conflict_id)
+    if record.get("state") != "open":
+        raise AgentMemoryError(
+            f"cannot dismiss {conflict_id}: state is {record.get('state')}; only open conflicts can be dismissed"
+        )
+    a = load_memory(store, record["memory_a"])
+    b = load_memory(store, record["memory_b"])
+    timestamp = now_utc()
+    record["state"] = "dismissed"
+    record["dismissed_at"] = timestamp
+    record["dismissed_by"] = actor
+    record["dismissed_snapshot"] = {
+        "memory_a_updated_at": a.get("updated_at"),
+        "memory_b_updated_at": b.get("updated_at"),
+    }
+    _write_text_utf8(store / CONFLICT_SUBDIR / f"{conflict_id}.json",
+                     json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "CONFLICT_DISMISSED", None, actor, {
+        "conflict_id": conflict_id,
+        "memory_a": a["id"],
+        "memory_b": b["id"],
+    })
+    return record
+
+
+def resolve_conflict(store: pathlib.Path, conflict_id: str, old_id: str, new_id: str,
+                     actor: str = "human") -> dict:
+    """Human-only resolution: supersede old by new via the existing
+    supersede() machinery, then close the observation (audited).
+
+    EVIDENCE-038 AC7: resolution MUST call the existing supersede() - same
+    guards (no chains, only active, bidirectional links). The conflict
+    record is closed with closed_reason='superseded' and audited as
+    CONFLICT_RESOLVED. Never invents a new relationship mechanism.
+    """
+    record = load_conflict(store, conflict_id)
+    if record.get("state") != "open":
+        raise AgentMemoryError(
+            f"cannot resolve {conflict_id}: state is {record.get('state')}; only open conflicts can be resolved"
+        )
+    # The conflict must reference the pair being superseded.
+    pair = {record.get("memory_a"), record.get("memory_b")}
+    if pair != {old_id, new_id}:
+        raise AgentMemoryError(
+            f"conflict {conflict_id} references {record.get('memory_a')}/{record.get('memory_b')}, "
+            f"not {old_id}/{new_id}; resolve the correct pair"
+        )
+    supersede(store, old_id, new_id, actor=actor)  # existing machinery + guards
+    timestamp = now_utc()
+    record["state"] = "closed"
+    record["closed_at"] = timestamp
+    record["closed_by"] = actor
+    record["closed_reason"] = "superseded"
+    _write_text_utf8(store / CONFLICT_SUBDIR / f"{conflict_id}.json",
+                     json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+    append_audit(store, "CONFLICT_RESOLVED", old_id, actor, {
+        "conflict_id": conflict_id,
+        "new_id": new_id,
+        "reason": "superseded",
+    })
+    return record
+
+
 def list_memories(store: pathlib.Path, mem_type: str | None = None, status: str | None = None) -> list[dict]:
     """List memory records, newest first (id as final tie-break for determinism)."""
     records: list[dict] = []
@@ -984,6 +1314,7 @@ def status_summary(store: pathlib.Path) -> dict:
         by_trust[r.get("trust", "?")] = by_trust.get(r.get("trust", "?"), 0) + 1
     config = load_config(store)
     suggestions = list_suggestions(store)
+    conflicts = list_conflicts(store)
     return {
         "project": config.get("project", store.parent.name),
         "store": str(store),
@@ -993,6 +1324,7 @@ def status_summary(store: pathlib.Path) -> dict:
         "by_trust": by_trust,
         "audit_events": len(read_audit(store)),
         "suggestions_pending": sum(1 for s in suggestions if s.get("state") == "pending"),
+        "conflicts_open": sum(1 for c in conflicts if c.get("state") == "open"),
     }
 
 
@@ -1448,6 +1780,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_sug.add_argument("--state", choices=SUGGESTION_STATES, help="filter (list only)")
     p_sug.add_argument("--json", action="store_true")
 
+    p_conf = sub.add_parser("conflicts",
+                            help="human review of possible-conflict observations (T4)")
+    p_conf.add_argument("action", choices=("scan", "list", "dismiss", "resolve"))
+    p_conf.add_argument("conflict_id", nargs="?", help="conflict record id (dismiss/resolve)")
+    p_conf.add_argument("--old", help="memory id to mark superseded (resolve only)")
+    p_conf.add_argument("--new", help="memory id that supersedes (resolve only)")
+    p_conf.add_argument("--state", choices=CONFLICT_STATES, help="filter (list only)")
+    p_conf.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -1656,6 +1997,47 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"rejected {args.sug_id}")
             return 0
 
+        if args.command == "conflicts":
+            if args.action == "scan":
+                report = scan_conflicts(store)
+                if args.json:
+                    _emit_json(report)
+                else:
+                    print(f"scanned {report['scanned']} active memorie(s): "
+                          f"{report['candidates']} new possible conflict(s), "
+                          f"{report['already_open']} already open, "
+                          f"{report['dismissed_unchanged']} dismissed-unchanged skipped")
+                    if report["closed_stale"]:
+                        print(f"  {report['closed_stale']} stale observation(s) closed (state changed)")
+            elif args.action == "list":
+                conflicts = list_conflicts(store, state=args.state)
+                if args.json:
+                    _emit_json({"results": conflicts, "count": len(conflicts)})
+                else:
+                    for c in conflicts:
+                        ex = c.get("explanation", {})
+                        print(f"{c['id']}  [{ex.get('same_type', '?')}] "
+                              f"{c['memory_a']} <-> {c['memory_b']} (state={c['state']})")
+                    print(f"{len(conflicts)} result(s)" if conflicts else "0 results")
+            elif args.action == "dismiss":
+                if not args.conflict_id:
+                    raise UsageError("conflicts dismiss requires a conflict id")
+                rec = dismiss_conflict(store, args.conflict_id)
+                if args.json:
+                    _emit_json(rec)
+                else:
+                    print(f"dismissed {args.conflict_id}")
+            else:  # resolve
+                if not args.conflict_id or not args.old or not args.new:
+                    raise UsageError(
+                        "conflicts resolve requires <conflict_id> --old <id> --new <id>")
+                rec = resolve_conflict(store, args.conflict_id, args.old, args.new)
+                if args.json:
+                    _emit_json(rec)
+                else:
+                    print(f"resolved {args.conflict_id}: {args.old} superseded by {args.new}")
+            return 0
+
         if args.command == "status":
             summary = status_summary(store)
             if args.json:
@@ -1666,6 +2048,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"total memories: {summary['total']}")
                 print(f"audit events  : {summary['audit_events']}")
                 print(f"pending sugg  : {summary['suggestions_pending']}")
+                print(f"open conflicts: {summary['conflicts_open']}")
                 print("by type      : " + ", ".join(f"{k}={v}" for k, v in summary['by_type'].items()))
                 print("by status    : " + ", ".join(f"{k}={v}" for k, v in summary['by_status'].items()))
                 print("by trust     : " + ", ".join(f"{k}={v}" for k, v in summary['by_trust'].items()))

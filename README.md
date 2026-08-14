@@ -100,7 +100,8 @@ agent-memory recall "auth" --path src/auth/login.py
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
 | `suggestions list \| approve <sug_id> --trust verified\|approved \| reject <sug_id>` | human review of agent suggestions (T3 approve-to-persist loop) |
-| `status [--json]` | store health + counts (incl. pending suggestions) |
+| `conflicts scan \| list \| dismiss <cf_id> \| supersede <old_id> <new_id>` | human review of possible-conflict pairs (T4 detection, EVIDENCE-038/039) |
+| `status [--json]` | store health + counts (incl. pending suggestions + open conflicts) |
 
 Exit codes: `0` success · `1` runtime error · `2` usage error.
 Every command supports `--json` for machine-readable output.
@@ -241,9 +242,9 @@ to AI coding agents through the official MCP SDK:
 - Tools: `memory_recall`, `memory_search`, `memory_get`, `memory_history`,
   `memory_suggest`, `memory_create`, `memory_validate`
 - The tool surface IS the permission boundary: `delete`, `promote`,
-  `supersede`, `import`, and the T3 suggestion review commands are never
-  exposed to agents - promotion/approval stay human-only (CLI), deletion
-  stays CLI-only
+  `supersede`, `import`, and the T3/T4 review commands (`suggestions`,
+  `conflicts`) are never exposed to agents - promotion/approval stay
+  human-only (CLI), deletion stays CLI-only
 - `memory_suggest` enqueues a validated, secret-screened **pending
   suggestion** (T3 approve-to-persist loop, EVIDENCE-034): the AI
   proposes, only a human converts it into a memory (`suggestions
@@ -271,9 +272,9 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (302 checks)
-python _audit_cli.py           # external-API audit, real binary via subprocess (140 checks)
-python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (70 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (347 checks)
+python _audit_cli.py           # external-API audit, real binary via subprocess (161 checks)
+python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (71 checks)
 ```
 
 `_audit_cli.py` treats the CLI as an external API: every check runs the real

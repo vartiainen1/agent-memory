@@ -5,6 +5,30 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 Tier 4, possible-conflict detection - EVIDENCE-038/039)
+- New CLI `conflicts` review commands: `conflicts scan` (on-demand,
+  deterministic possible-conflict detection over ACTIVE memories),
+  `conflicts list [--state open|dismissed|resolved]`, `conflicts
+  dismiss <cf_id>`, `conflicts supersede <old_id> <new_id>`.
+- Narrow candidate definition (EVIDENCE-038): same type + shared path
+  (path_matches) + ≥2 shared high-weight terms + ≥1 distinctive shared
+  term; already-related pairs ineligible (supersession-linked, already
+  open, dismissed since content changed).
+- A conflict record is an OBSERVATION, not a memory: `.agent/conflicts/
+  cf_<uuid>.json`, separate id space, no schema change, no new memory
+  status. The explanation carries WHY (shared paths/terms/type, trust and
+  age of each) - never a winner, never a `relationship: supersedes`
+  conclusion. Trust/age explain, they never decide.
+- Dismissal is an audited human decision and NOT permanent: if either
+  member's content changes, the pair becomes eligible again. Resolution
+  reuses the existing `supersede()` machinery. Stale open records are
+  closed by later scans (CONFLICT_CLOSED).
+- Human-CLI only: no conflict tool on the MCP agent surface (an agent
+  can neither act on nor see conflicts).
+- `status` now reports the open-conflict count.
+- +45 unit checks (347 total), +21 external-API audit checks (161),
+  MCP surface pin extended (conflict commands forbidden); spec section
+  18 + README updated in the same commit (drift-guard clean).
 ### Added (v0.3 Tier 3, suggestions - approve-to-persist loop - EVIDENCE-034)
 - `memory_suggest` now ENQUEUES a validated, secret-screened pending
   suggestion (`.agent/suggestions/sug_<uuid>.json`) instead of returning a

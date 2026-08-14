@@ -395,11 +395,18 @@ def test_server_surface_exactly_allowed_tools() -> None:
           names == sorted(mcp.ALLOWED_TOOLS), f"(got {names})")
     forbidden = {"memory_delete", "memory_promote", "memory_supersede",
                  "memory_import", "memory_purge", "memory_allow_secret",
-                 "suggestion_approve", "suggestion_reject"}
+                 "suggestion_approve", "suggestion_reject",
+                 "conflict_scan", "conflict_dismiss", "conflict_resolve",
+                 "memory_conflicts"}
     check("surface: delete/promote/supersede/import NOT exposed",
           not (set(names) & forbidden), f"(got {names})")
     check("surface: approve/reject NOT exposed (agent cannot approve itself)",
           not (set(names) & {"suggestion_approve", "suggestion_reject"}),
+          f"(got {names})")
+    check("surface: T4 conflict tools NOT exposed (EVIDENCE-038 FORK 4 - "
+          "review is human-CLI only)",
+          not (set(names) & {"conflict_scan", "conflict_dismiss",
+                             "conflict_resolve", "memory_conflicts"}),
           f"(got {names})")
 
 

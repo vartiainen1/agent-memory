@@ -1343,6 +1343,368 @@ def test_t3_cli_flow() -> None:
     r = _run_cli(tmp, "suggestions", "bogus")
     check("t3-cli: bad action exit 2", r.returncode == 2, f"(rc={r.returncode})")
 
+# --------------------------------------------------------------------------
+# T4 possible-conflict detection (EVIDENCE-038, user-locked 2026-08-14)
+# --------------------------------------------------------------------------
+
+def _conflict_pair(store, title_a, content_a, title_b, content_b,
+                   type_a="decision", type_b=None, paths_a=None, paths_b=None,
+                   tags_a=None, tags_b=None):
+    """Create two memories + scan; return (memories dict, conflict report)."""
+    type_b = type_b or type_a
+    a = am.create_memory(store, type_a, title_a, content_a, project="p",
+                         paths=paths_a, tags=tags_a)
+    b = am.create_memory(store, type_b, title_b, content_b, project="p",
+                         paths=paths_b, tags=tags_b)
+    return {"a": a, "b": b}, am.scan_conflicts(store)
+
+
+def test_t4_narrow_candidate_detected() -> None:
+    """AC2: same type + shared scope + meaningful topical overlap -> one
+    possible-conflict record with an explanation (never a verdict)."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout",
+        "token refresh invalidation session secret policy",
+        "auth session invalidation",
+        "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+        tags_a=["auth"], tags_b=["auth"],
+    )
+    check("t4: one candidate from an overlapping pair", rep["candidates"] == 1,
+          f"(got {rep['candidates']})")
+    rec = rep["results"][0]
+    check("t4: conflict id space is cf_", rec["id"].startswith("cf_"),
+          f"(got {rec['id']})")
+    check("t4: state open", rec["state"] == "open")
+    check("t4: record references both memory ids",
+          {rec["memory_a"], rec["memory_b"]} == {mems["a"]["id"], mems["b"]["id"]})
+    ex = rec["explanation"]
+    check("t4: shared scope paths recorded", "src/auth/**" in ex["shared_scope_paths"]
+          or "src/auth/session.py" in ex["shared_scope_paths"], f"(got {ex})")
+    check("t4: shared tags recorded", "auth" in ex["shared_tags"])
+    check("t4: shared high-weight terms recorded (>= 2)",
+          len(ex["shared_high_weight_terms"]) >= am.CONFLICT_MIN_SHARED_TERMS,
+          f"(got {ex['shared_high_weight_terms']})")
+    check("t4: same_type recorded", ex["same_type"] == "decision")
+    check("t4: trust explains, never decides (both recorded)",
+          "trust_a" in ex and "trust_b" in ex)
+    check("t4: no winner field (AC4)", "winner" not in ex
+          and "relationship" not in ex and "verdict" not in ex)
+    check("t4: no memory mutation from scan (AC5)",
+          am.list_memories(store)[0]["status"] == "active"
+          and am.list_memories(store)[0]["trust"] == "untrusted")
+    events = [e["event"] for e in am.read_audit(store)]
+    check("t4: CONFLICT_DETECTED audited", "CONFLICT_DETECTED" in events,
+          f"(got {events})")
+
+
+def test_t4_scan_deterministic_and_deduped() -> None:
+    """AC1/AC3: identical store -> identical scan outcome; re-scan does not
+    duplicate open records; unrelated pairs are never flagged."""
+    store = tmp_store()
+    _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    am.create_memory(store, "decision", "frontend button layout",
+                     "padding margin css layout", project="p",
+                     paths=["src/frontend/**"])
+    r1 = am.scan_conflicts(store)
+    r2 = am.scan_conflicts(store)
+    check("t4: second scan adds zero candidates", r2["candidates"] == 0,
+          f"(got {r2['candidates']})")
+    check("t4: second scan reports already_open", r2["already_open"] == 1,
+          f"(got {r2['already_open']})")
+    ids = {r["memory_a"] + r["memory_b"] for r in r2["results"]}
+    unrelated = [r for r in r2["results"]
+                 if "frontend" in r["memory_a"] + r["memory_b"]]
+    check("t4: unrelated pair never flagged", unrelated == [], f"(got {unrelated})")
+
+
+def test_t4_same_type_required() -> None:
+    """AC2: same type is mandatory - a lesson sharing scope + terms with a
+    decision is not a candidate."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        type_a="decision", type_b="lesson",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    check("t4: different types -> no candidate", rep["candidates"] == 0,
+          f"(got {rep['candidates']})")
+
+
+def test_t4_shared_scope_required() -> None:
+    """AC2: shared path OR shared tag is required; overlapping text alone is
+    not enough."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+    )
+    check("t4: no shared scope -> no candidate", rep["candidates"] == 0,
+          f"(got {rep['candidates']})")
+    # shared tag only, no path overlap
+    store2 = tmp_store()
+    mems2, rep2 = _conflict_pair(
+        store2,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        tags_a=["auth"], tags_b=["auth"],
+    )
+    check("t4: shared tag IS shared scope", rep2["candidates"] == 1,
+          f"(got {rep2['candidates']})")
+
+
+def test_t4_meaningful_overlap_required() -> None:
+    """AC2: topical overlap must be MEANINGFUL - shared corpus-common terms
+    (present in > 2/3 of the active set) do not qualify. Build a corpus where
+    the two candidates share only generic terms, and a control where a
+    distinctive term is shared in the same corpus."""
+    store = tmp_store()
+    # 6 active memories; the weak pair shares only 'auth'/'policy', which
+    # appear in all 6 -> above max_df (ceil(6*2/3) = 4) -> not distinctive.
+    # Each filler carries a UNIQUE token so no two fillers share a
+    # distinctive term (they only share the corpus-common auth/policy).
+    unique = ["zebra", "umbrella", "quasar", "giraffe"]
+    for i, tok in enumerate(unique):
+        am.create_memory(store, "decision", f"auth policy filler {i}",
+                         f"auth policy filler {i} {tok}", project="p",
+                         paths=["src/auth/**"])
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh", "auth policy one",
+        "auth session", "auth policy two",
+        paths_a=["src/auth/**"], paths_b=["src/auth/**"],
+    )
+    check("t4: weak (corpus-common) overlap -> no candidate",
+          rep["candidates"] == 0, f"(got {rep['candidates']})")
+    # Control: same corpus shape, but the pair shares a distinctive term
+    # ('rotation'/'token' appear only in these two) -> flagged.
+    store2 = tmp_store()
+    for i, tok in enumerate(unique):
+        am.create_memory(store2, "decision", f"auth policy filler {i}",
+                         f"auth policy filler {i} {tok}", project="p",
+                         paths=["src/auth/**"])
+    mems2, rep2 = _conflict_pair(
+        store2,
+        "refresh token rotation", "token rotation refresh rotation policy",
+        "session token rotation", "token rotation session rotation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    check("t4: distinctive overlap still flagged in same corpus",
+          rep2["candidates"] == 1, f"(got {rep2['candidates']})")
+
+
+def test_t4_honest_zero() -> None:
+    """AC8: empty or unrelated store -> 0 possible conflicts, exit-able cleanly."""
+    store = tmp_store()
+    r = am.scan_conflicts(store)
+    check("t4: empty store honest zero", r["candidates"] == 0 and r["scanned"] == 0,
+          f"(got {r})")
+
+
+def test_t4_dismiss_lifecycle() -> None:
+    """AC6: dismiss is audited and terminal while memories are unchanged; a
+    later scan re-establishes the pair (observation, not authority)."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    rec = am.dismiss_conflict(store, cf)
+    check("t4: dismissed state + snapshot", rec["state"] == "dismissed"
+          and rec["dismissed_by"] == "human"
+          and rec["dismissed_snapshot"]["memory_a_updated_at"],
+          f"(got {rec})")
+    events = [e["event"] for e in am.read_audit(store)]
+    check("t4: CONFLICT_DISMISSED audited", "CONFLICT_DISMISSED" in events,
+          f"(got {events})")
+    r = am.scan_conflicts(store)
+    check("t4: dismissed-unchanged pair skipped", r["candidates"] == 0
+          and r["dismissed_unchanged"] == 1, f"(got {r})")
+    # A state change re-establishes the current state: supersede b by a new
+    # memory c. The old a<->b observation stays dismissed (not an authority),
+    # and the pair a<->b is now supersession-linked so never re-flagged. The
+    # genuinely new pair a<->c IS flagged (a new observation).
+    c = am.create_memory(store, "decision", "auth v2 unified",
+                         "token refresh invalidation session unified policy",
+                         project="p", paths=["src/auth/**"], tags=["auth"])
+    am.supersede(store, mems["b"]["id"], c["id"])
+    r2 = am.scan_conflicts(store)
+    records = {x["id"]: x for x in am.list_conflicts(store)}
+    check("t4: old a<->b record stays dismissed (not resurrected)",
+          records[cf]["state"] == "dismissed", f"(got {records[cf]})")
+    new_ids = [r["id"] for r in r2["results"]]
+    check("t4: old dismissed record not re-opened", cf not in new_ids,
+          f"(got {new_ids})")
+    new_pair = [r for r in r2["results"]
+                if c["id"] in (r["memory_a"], r["memory_b"])]
+    check("t4: new a<->c pair flagged as fresh observation",
+          len(new_pair) == 1, f"(got {new_pair})")
+
+
+def test_t4_dismiss_guard() -> None:
+    """AC9: only open conflicts can be dismissed; missing id is a clean error."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    am.dismiss_conflict(store, cf)
+    try:
+        am.dismiss_conflict(store, cf)
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: re-dismiss refused (terminal)", raised)
+    try:
+        am.load_conflict(store, "cf_00000000-0000-0000-0000-000000000000")
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: missing conflict id raises clean error", raised)
+
+
+def test_t4_resolve_via_supersede() -> None:
+    """AC7: resolve calls the existing supersede() machinery (bidirectional
+    links, no chains, MEMORY_SUPERSEDED audit) and closes the observation."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    rec = am.resolve_conflict(store, cf, mems["a"]["id"], mems["b"]["id"])
+    check("t4: conflict closed with reason superseded", rec["state"] == "closed"
+          and rec["closed_reason"] == "superseded", f"(got {rec})")
+    old = am.load_memory(store, mems["a"]["id"])
+    new = am.load_memory(store, mems["b"]["id"])
+    check("t4: supersede wired old->new",
+          old["status"] == "superseded" and old["superseded_by"] == new["id"]
+          and new["supersedes"] == old["id"])
+    events = [e["event"] for e in am.read_audit(store)]
+    check("t4: MEMORY_SUPERSEDED + CONFLICT_RESOLVED audited",
+          "MEMORY_SUPERSEDED" in events and "CONFLICT_RESOLVED" in events,
+          f"(got {events})")
+
+
+def test_t4_resolve_guards() -> None:
+    """AC7/AC9: resolve only open records, only the referenced pair."""
+    store = tmp_store()
+    mems, rep = _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    cf = rep["results"][0]["id"]
+    other = am.create_memory(store, "decision", "frontend layout",
+                             "padding margin css", project="p")
+    try:
+        am.resolve_conflict(store, cf, mems["a"]["id"], other["id"])
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: resolving a different pair refused", raised)
+    am.resolve_conflict(store, cf, mems["a"]["id"], mems["b"]["id"])
+    try:
+        am.resolve_conflict(store, cf, mems["a"]["id"], mems["b"]["id"])
+        raised = False
+    except am.AgentMemoryError:
+        raised = True
+    check("t4: re-resolve refused (terminal)", raised)
+
+
+def test_t4_status_reports_open_conflicts() -> None:
+    store = tmp_store()
+    _conflict_pair(
+        store,
+        "auth refresh token timeout", "token refresh invalidation session policy",
+        "auth session invalidation", "session token refresh invalidation policy",
+        paths_a=["src/auth/**"], paths_b=["src/auth/session.py"],
+    )
+    summary = am.status_summary(store)
+    check("t4: status reports open conflict count", summary["conflicts_open"] == 1,
+          f"(got {summary})")
+
+
+def test_t4_cli_flow() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t4-cli-"))
+    _run_cli(tmp, "init", "--project", "demo")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth refresh token timeout",
+             "--content", "token refresh invalidation session policy",
+             "--paths", "src/auth/**", "--tags", "auth")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth session invalidation",
+             "--content", "session token refresh invalidation policy",
+             "--paths", "src/auth/session.py", "--tags", "auth")
+    r = _run_cli(tmp, "conflicts", "scan")
+    check("t4-cli: scan reports 1 new possible conflict",
+          r.returncode == 0 and "1 new possible conflict" in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "list", "--json")
+    data = json.loads(r.stdout)
+    check("t4-cli: list --json has 1 open",
+          data["count"] == 1 and data["results"][0]["state"] == "open",
+          f"(got {r.stdout!r})")
+    cf = data["results"][0]["id"]
+    r = _run_cli(tmp, "conflicts", "list")
+    check("t4-cli: human list shows pair + state",
+          "<->" in r.stdout and "state=open" in r.stdout, f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "dismiss", cf)
+    check("t4-cli: dismiss exit 0", r.returncode == 0 and "dismissed" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "dismiss", cf)
+    check("t4-cli: dismiss twice exit 1", r.returncode == 1,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+    r = _run_cli(tmp, "conflicts", "bogus")
+    check("t4-cli: bad action exit 2", r.returncode == 2, f"(rc={r.returncode})")
+
+
+def test_t4_cli_resolve_flow() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="agent-memory-t4-cli-"))
+    _run_cli(tmp, "init", "--project", "demo")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth refresh token timeout",
+             "--content", "token refresh invalidation session policy",
+             "--paths", "src/auth/**", "--tags", "auth")
+    _run_cli(tmp, "add", "--type", "decision", "--title", "auth session invalidation",
+             "--content", "session token refresh invalidation policy",
+             "--paths", "src/auth/session.py", "--tags", "auth")
+    _run_cli(tmp, "conflicts", "scan")
+    r = _run_cli(tmp, "conflicts", "list", "--json")
+    cf = json.loads(r.stdout)["results"][0]["id"]
+    r = _run_cli(tmp, "list", "--json")
+    mems = json.loads(r.stdout)["results"]
+    old = [m["id"] for m in mems if "timeout" in m["title"]][0]
+    new = [m["id"] for m in mems if "invalidation" in m["title"]][0]
+    r = _run_cli(tmp, "conflicts", "resolve", cf, "--old", old, "--new", new)
+    check("t4-cli: resolve exit 0", r.returncode == 0 and "superseded by" in r.stdout,
+          f"(rc={r.returncode}, out={r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "list", "--state", "closed")
+    check("t4-cli: closed record listed", "state=closed" in r.stdout,
+          f"(got {r.stdout!r})")
+    r = _run_cli(tmp, "conflicts", "resolve")
+    check("t4-cli: resolve missing args exit 2", r.returncode == 2,
+          f"(rc={r.returncode})")
+    r = _run_cli(tmp, "conflicts", "resolve", cf, "--old", old, "--new", new)
+    check("t4-cli: resolve twice exit 1", r.returncode == 1,
+          f"(rc={r.returncode}, err={r.stderr!r})")
+
 
 # --------------------------------------------------------------------------
 
