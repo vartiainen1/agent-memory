@@ -100,7 +100,7 @@ agent-memory recall "auth" --path src/auth/login.py
 | `supersede <old_id> <new_id>` | bidirectional supersession; a memory supersedes at most one other (linear chains allowed) |
 | `delete <mem_id> [--purge]` | tombstone delete; `--purge` physically removes untrusted only |
 | `suggestions list \| approve <sug_id> --trust verified\|approved \| reject <sug_id>` | human review of agent suggestions (T3 approve-to-persist loop) |
-| `conflicts scan \| list \| dismiss <cf_id> \| supersede <old_id> <new_id>` | human review of possible-conflict pairs (T4 detection, EVIDENCE-038/039) |
+| `conflicts scan \| list \| dismiss <cf_id> \| resolve <cf_id> --old <id> --new <id>` | human review of possible-conflict pairs (T4 detection, EVIDENCE-038/039) |
 | `status [--json]` | store health + counts (incl. pending suggestions + open conflicts) |
 
 Exit codes: `0` success · `1` runtime error · `2` usage error.

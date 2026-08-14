@@ -9,7 +9,8 @@ workflow tags whatever the top `## [X.Y.Z]` header says).
 - New CLI `conflicts` review commands: `conflicts scan` (on-demand,
   deterministic possible-conflict detection over ACTIVE memories),
   `conflicts list [--state open|dismissed|resolved]`, `conflicts
-  dismiss <cf_id>`, `conflicts supersede <old_id> <new_id>`.
+  dismiss <cf_id>`, `conflicts resolve <cf_id> --old <old_id>
+  --new <new_id>` (resolution wires the existing `supersede()`).
 - Narrow candidate definition (EVIDENCE-038): same type + shared path
   (path_matches) + ≥2 shared high-weight terms + ≥1 distinctive shared
   term; already-related pairs ineligible (supersession-linked, already
