@@ -1215,6 +1215,12 @@ def _git_out(cwd: pathlib.Path, *args: str) -> str | None:
             ["git", "--no-pager", *args],
             cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
             errors="replace", env=env, timeout=10,
+            # EVIDENCE-045 (dogfood): when the parent is an MCP stdio server,
+            # our own stdin is an open protocol pipe that never reaches EOF;
+            # git inherits it and blocks reading it -> 10s timeout -> the
+            # whole git snapshot silently fails (None). Redirect stdin to
+            # DEVNULL so git never waits on our inherited stdio.
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return None

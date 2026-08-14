@@ -273,7 +273,7 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (379 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (381 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (173 checks)
 python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (71 checks)
 ```
