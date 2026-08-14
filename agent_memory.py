@@ -1383,6 +1383,15 @@ SCORE_FLOOR_RATIO = 0.25  # recall-only: drop text scores below ratio x top text
 COVERAGE_BONUS_MAX = 1.5  # scaled by (# distinct query terms matched / # terms)
 TAG_EXACT_BONUS = 0.5  # per exact tag == query-term match (curated metadata)
 
+# A' deterministic ranking-only expansion (EVIDENCE-068, approved design):
+# a fixed, corpus-pure map from a query term to alternates that share its
+# meaning for RANKING ONLY. An alternate hit is weighted by the ORIGINAL
+# term's idf. Alternates never feed candidate admission (the honest-zero
+# gate reads only original-term text) and never feed the T2.2 coverage/tag
+# bonuses (those stay on original matches). recall-only; search is
+# unexpanded. No wall-clock, network, or LLM.
+EXPANSION_TERMS: dict[str, tuple[str, ...]] = {"message": ("title",)}
+
 
 def _term_doc_freqs(records: list[dict], terms: list[str]) -> dict[str, int]:
     """df(t): number of candidate records whose title/tags/content contain t."""
@@ -1421,10 +1430,22 @@ def _field_score(text: str, terms: list[str], idf: dict[str, float]) -> float:
     return score
 
 
+def _alt_field_score(field: str, alts: list[tuple[str, str]],
+                     idf: dict[str, float]) -> float:
+    """A' expansion contribution for one field (EVIDENCE-068): alternate
+    hits weighted by the ORIGINAL term's idf, additive to text_orig. No
+    phrase bonus and no coverage/tag bonuses here - expansion never changes
+    phrase semantics and never feeds the T2.2 signals (both stay on
+    original query terms)."""
+    lower = field.lower()
+    return sum(lower.count(alt) * idf[orig] for orig, alt in alts)
+
+
 def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
                   path: str | None = None,
                   git_bonus: dict[str, float] | None = None,
-                  floor_ratio: float | None = None) -> list[dict]:
+                  floor_ratio: float | None = None,
+                  expansion: bool = False) -> list[dict]:
     """Deterministic relevance ranking shared by search and recall.
 
     Score = 3 x title + 2 x tags + 1 x content, each field IDF-weighted with
@@ -1450,8 +1471,26 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
     scales with ln N) and can never zero out a sparse-but-unique match (the
     top text score always passes). Applied by recall only; search stays
     inclusive so operators keep full visibility (EVIDENCE-007).
+
+    expansion (A', EVIDENCE-068, recall-only): when set, each original term
+    in EXPANSION_TERMS contributes IDF-weighted alternate hits to the text
+    score used for RANKING and the floor comparison. Admission NEVER uses
+    expanded scores (the honest-zero gate reads text_orig = original terms
+    only), so expansion can never create a candidate, and the floor anchor
+    (best) is computed from text_orig only, so expansion can never move the
+    floor itself - it can only lift an already-admitted memory over it. T2.2
+    coverage/tag bonuses, the phrase bonus, path tiers, the git bonus, and
+    tie-breaking are unchanged. search_memories never sets expansion.
     """
     git_bonus = git_bonus or {}
+    alts = []
+    if expansion and terms:
+        # Deterministic: alternates in map order, deduped against original
+        # terms so an alternate that is itself a query term is not counted
+        # twice, and never self-alias counted.
+        alts = [(orig, alt) for orig in terms
+                for alt in EXPANSION_TERMS.get(orig, ())
+                if alt != orig and alt not in terms]
     entries = []
     for r in records:
         tags_text = " ".join(r.get("tags", []))
@@ -1465,7 +1504,8 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
         # (curated metadata is stronger evidence than a content substring).
         # Both attach ONLY when the memory already has term hits (matched
         # counts hits; zero hits => zero bonus), keeping the honest-zero
-        # gate and the relevance floor's relative semantics intact.
+        # gate and the relevance floor's relative semantics intact. Both
+        # stay on ORIGINAL matches - expansion never feeds them.
         if terms:
             blob = " ".join((r.get("title", ""), tags_text,
                              r.get("content", ""))).lower()
@@ -1475,26 +1515,36 @@ def _rank_records(records: list[dict], terms: list[str], idf: dict[str, float],
                            if t in [x.lower() for x in r.get("tags", [])])
             text += TAG_EXACT_BONUS * tag_hits
             text = round(text, 6)
+        text_orig = text  # sole admission value; identical to the shipped scorer
+        if alts:
+            # A' ranking-only expansion: additive alternate hits, weighted by
+            # the ORIGINAL term's idf, no phrase bonus, no T2.2 interaction.
+            text = round(text_orig
+                         + 3.0 * _alt_field_score(r.get("title", ""), alts, idf)
+                         + 2.0 * _alt_field_score(tags_text, alts, idf)
+                         + 1.0 * _alt_field_score(r.get("content", ""), alts, idf), 6)
         path_bonus = 0.0
         if path:
             for pat in r.get("paths", []):
                 tier = path_tier(pat, path)
                 if tier:
                     path_bonus = max(path_bonus, PATH_TIER_BONUS[tier])
-        entries.append((text, path_bonus, r))
-    best = max((e[0] for e in entries), default=0.0)
+        entries.append((text_orig, text, path_bonus, r))
+    best = max((e[0] for e in entries), default=0.0)  # floor anchor: text_orig ONLY
     scored = []
-    for text, path_bonus, r in entries:
+    for text_orig, text, path_bonus, r in entries:
         # The honest-zero gate and the precision floor use ONLY the memory's
-        # own declared path tier (explicit operator/agent intent). The T5 git
-        # bonus is a pure RANKING signal within the already-qualified set - it
-        # never expands recall (ambient repo state must not silently add
-        # results) and never rescues weak text from the floor (EVIDENCE-041).
-        if text <= 0 and path_bonus <= 0:
-            continue  # honest zero: no term hits and no declared path match.
-        if (floor_ratio is not None and path_bonus <= 0 and text > 0
+        # own declared path tier (explicit operator/agent intent) and, for
+        # the gate, ONLY original-term text: A' expansion can never create a
+        # candidate (EVIDENCE-068). The T5 git bonus is a pure RANKING
+        # signal within the already-qualified set - it never expands recall
+        # (ambient repo state must not silently add results) and never
+        # rescues weak text from the floor (EVIDENCE-041).
+        if text_orig <= 0 and path_bonus <= 0:
+            continue  # honest zero: no ORIGINAL term hits and no declared path.
+        if (floor_ratio is not None and path_bonus <= 0 and text_orig > 0
                 and text < floor_ratio * best):
-            continue  # weak tail below the relevance floor.
+            continue  # weak tail below the relevance floor (expanded score).
         score = text + path_bonus + git_bonus.get(r.get("id", ""), 0.0)
         scored.append((round(score, 6), r))
     scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", ""),
@@ -1517,6 +1567,10 @@ def search_memories(
     limit: int = DEFAULT_SEARCH_LIMIT,
 ) -> list[dict]:
     """Operator search: case-insensitive textual match on title/content/tags.
+
+    Search is deliberately UNEXPANDED: it never applies EXPANSION_TERMS
+    (A', EVIDENCE-068) and has no floor - operators keep full, original-term
+    visibility of weak and superseded matches (EVIDENCE-007).
 
     Empty query or no matches -> [] (caller prints '0 results', exit 0).
     """
@@ -1546,6 +1600,12 @@ def recall_memories(
     """Agent recall: active + trusted memories, deterministic scoring, tiered
     path bonus, and T5 git bonus from STORED snapshots only (EVIDENCE-041).
 
+    A' ranking-only expansion (EXPANSION_TERMS, EVIDENCE-068) is applied:
+    alternate terms contribute to ranking and the floor comparison only -
+    candidate admission stays original-term-only, so an honest zero can
+    never be rescued and the candidate set never grows. search_memories is
+    the unexpanded counterpart (operators keep full, unexpanded visibility).
+
     branch: the CURRENT branch name, supplied explicitly by the caller. It
     is compared against each memory's STORED git snapshot branch (captured
     at write time) - live git is NEVER consulted at recall, so same store +
@@ -1565,7 +1625,7 @@ def recall_memories(
     # Tier 2.1 floor (EVIDENCE-010/015): recall is agent-facing, precision
     # matters - drop the weak tail, keep path matches, keep honest zeros.
     return _rank_records(records, terms, idf, path=path, git_bonus=git_bonus,
-                          floor_ratio=SCORE_FLOOR_RATIO)[:limit]
+                          floor_ratio=SCORE_FLOOR_RATIO, expansion=True)[:limit]
 
 
 def status_summary(store: pathlib.Path) -> dict:

@@ -342,6 +342,234 @@ def test_t22_search_shares_coverage_scoring() -> None:
           s[0]["id"] == full["id"], f"(got {[r['title'] for r in s]})")
 
 
+# === A' ranking-only expansion (EVIDENCE-068, approved gated change) ===
+
+def test_a_prime_expansion_terms_constant() -> None:
+    """A' INVARIANT (EVIDENCE-068): the expansion map is EXACTLY the approved
+    single mapping message -> title. Any additional mapping needs separate
+    evidence and must be deliberate - this test is the tripwire."""
+    check("a': EXPANSION_TERMS is exactly {message: (title,)}",
+          am.EXPANSION_TERMS == {"message": ("title",)},
+          f"(got {am.EXPANSION_TERMS!r})")
+
+
+def test_a_prime_deterministic_repeated_recall() -> None:
+    """A' INVARIANT (EVIDENCE-068): expansion keeps recall byte-identical
+    across repeated calls on the same store/query/path/branch."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "commit message gate alpha",
+                     "every commit carries a message", tags=["ci"], project="p")
+    am.create_memory(store, "decision", "the title page layout",
+                     "PR title carries the area marker", tags=["design"],
+                     project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    r1 = [(m["id"], m["title"]) for m in am.recall_memories(store, "commit message gate")]
+    r2 = [(m["id"], m["title"]) for m in am.recall_memories(store, "commit message gate")]
+    check("a': repeated recall byte-identical with expansion",
+          r1 == r2, f"(got {r1} vs {r2})")
+
+
+def test_a_prime_honest_zero_admission() -> None:
+    """A' INVARIANT (EVIDENCE-067/068): the discriminating honest-zero case -
+    a memory containing ONLY the expansion alternate ('title') but no
+    original query term must NOT satisfy 'message'. Candidate A failed this;
+    A' must pass it for BOTH recall and search."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "The title page layout",
+                     "layout decisions live here", tags=["design"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    check("a': recall 'message' stays an honest zero (title-only memory excluded)",
+          am.recall_memories(store, "message") == [],
+          f"(got {len(am.recall_memories(store, 'message'))})")
+    check("a': search 'message' stays an honest zero (search is unexpanded)",
+          am.search_memories(store, "message") == [],
+          f"(got {len(am.search_memories(store, 'message'))})")
+
+
+def test_a_prime_search_unexpanded() -> None:
+    """A' INVARIANT (EVIDENCE-068): search is byte-identical and unexpanded - a
+    memory matching only an alternate is never surfaced or re-ranked by
+    search, and original-term ranking is untouched."""
+    store = tmp_store()
+    alpha = am.create_memory(store, "decision", "message handler policy",
+                             "message routing is explicit", tags=["messaging"],
+                             project="p")
+    beta = am.create_memory(store, "decision", "title page beta",
+                            "title metadata only", tags=["design"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    s = am.search_memories(store, "message")
+    check("a': search returns only the original-term match",
+          [m["id"] for m in s] == [alpha["id"]],
+          f"(got {[m['title'] for m in s]})")
+    check("a': alternate-only memory never surfaces in search",
+          beta["id"] not in [m["id"] for m in s],
+          f"(got {[m['title'] for m in s]})")
+
+
+def test_a_prime_trust_irrelevant_to_expansion() -> None:
+    """A' INVARIANT (EVIDENCE-068): trust does not participate - an untrusted
+    memory with expansion-eligible content stays excluded from recall;
+    expansion never bypasses the trust filter."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "untrusted message title gate",
+                     "commit message title gate", tags=["ci"], project="p")
+    trusted = am.create_memory(store, "decision", "trusted message gate",
+                               "commit message gate area", tags=["ci"],
+                               project="p")
+    am.promote_trust(store, trusted["id"], "approved")
+    res = am.recall_memories(store, "commit message gate")
+    check("a': untrusted never admitted, trusted still recalled",
+          [m["id"] for m in res] == [trusted["id"]],
+          f"(got {[m['title'] for m in res]})")
+
+
+def test_a_prime_git_bonus_orthogonal() -> None:
+    """A' INVARIANT (EVIDENCE-041 preserved): the git bonus stays a pure
+    ranking signal with expansion active - it never creates candidates and
+    never rescues weak text from the floor."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "commit message gate",
+                     "commit message gate enforced by CI", project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    records = [r for r in am.list_memories(store, status="active")
+               if r.get("trust") != "untrusted"]
+    terms = ["commit", "message", "gate"]
+    idf = am._idf_weights(len(records), am._term_doc_freqs(records, terms))
+    ghost = {"id": "mem_ghost", "title": "zzz absent", "tags": [],
+             "content": "zzz", "created_at": "2026-01-01T00:00:00",
+             "status": "active", "trust": "approved", "paths": []}
+    out = am._rank_records(records + [ghost], terms, idf,
+                           git_bonus={"mem_ghost": 50.0},
+                           floor_ratio=am.SCORE_FLOOR_RATIO, expansion=True)
+    check("a': git bonus never creates a candidate under expansion",
+          all(m["id"] != "mem_ghost" for m in out), f"(got {[m['id'] for m in out]})")
+    below = {"id": "mem_below", "title": "x", "tags": [],
+             "content": "gate", "created_at": "2026-01-02T00:00:00",
+             "status": "active", "trust": "approved", "paths": []}
+    out2 = am._rank_records(records + [below], terms, idf,
+                            git_bonus={"mem_below": 50.0},
+                            floor_ratio=am.SCORE_FLOOR_RATIO, expansion=True)
+    check("a': git bonus never rescues weak text from the floor",
+          all(m["id"] != "mem_below" for m in out2),
+          f"(got {[m['id'] for m in out2]})")
+
+
+def test_a_prime_t22_unchanged() -> None:
+    """A' INVARIANT (EVIDENCE-068): T2.2 coverage/tag bonuses use ORIGINAL
+    query-term matches only - an alternate-only memory gains zero bonus and
+    stays a zero-hit memory, even when expansion is active."""
+    store = tmp_store()
+    am.create_memory(store, "decision", "the title page",
+                     "title metadata only", tags=["design"], project="p")
+    for r in am.list_memories(store):
+        am.promote_trust(store, r["id"], "approved")
+    records = am.list_memories(store, status="active")
+    r = records[0]
+    terms = ["message"]
+    idf = am._idf_weights(len(records), am._term_doc_freqs(records, terms))
+    blob = " ".join((r["title"], " ".join(r.get("tags", [])),
+                      r["content"])).lower()
+    matched = sum(1 for t in terms if t in blob)
+    check("a': T2.2 coverage bonus is 0 for alternate-only matches",
+          matched == 0 and am.COVERAGE_BONUS_MAX * (matched / len(terms)) == 0.0,
+          f"(matched {matched})")
+    out = am._rank_records(records, terms, idf,
+                           floor_ratio=am.SCORE_FLOOR_RATIO, expansion=True)
+    check("a': alternate-only memory has zero original text (honest zero kept)",
+          out == [], f"(got {len(out)})")
+
+
+def _a_prime_real_corpus_store():
+    """The E024 real-content store (EVIDENCE-066/067/068): the same 18
+    memories the evaluation harness builds - real product seeds + real E012
+    gate errors + the real rules.txt import (RULE 5 AREA-MARKER GATE is the
+    E024 target). Reproduces the exact idf/floor distribution that makes
+    E024 a genuine lexical gap."""
+    store = tmp_store()
+    seeds = [
+        ("constraint", "Trust promotion is human-only; never system via CLI",
+         "V0.1_SPEC.md 9: promote is human-authorized; agents can never promote "
+         "themselves or reach trust=system. No downgrades in v0.1.",
+         ["trust", "security"]),
+        ("constraint", "Secret detection runs BEFORE storage; --allow-secret is audited",
+         "V0.1_SPEC.md 5: reject secrets before persistence; --allow-secret is "
+         "the explicit override and must write a SECRET_OVERRIDE audit event.",
+         ["secrets", "security"]),
+        ("constraint", "Memory files are authoritative; any index is derived",
+         "V0.1_SPEC.md 2: .agent/memory/**/*.json is the authoritative record; "
+         "an index.db (v0.2) must be rebuildable from source.",
+         ["spec", "architecture"]),
+        ("decision", "v0.1 keeps provenance/fingerprint schema-ready but unpopulated",
+         "V0.1_SPEC.md 3.9: source fields exist in the schema but stay null.",
+         ["spec", "v02"]),
+        ("lesson", "Windows bash pipelines carry CRLF - strip \r from captured ids",
+         "Piped stdout from the CLI translates \n to \r\n on Windows.",
+         ["windows", "integration"]),
+        ("lesson", "Empty query is a successful 0 results, not a usage error",
+         "ROUND 4 contract: search '' and recall '' print '0 results' with exit 0.",
+         ["search", "contract"]),
+    ]
+    errors = [
+        ("error", "CI commit-message gate missing",
+         "AREA: CI commit-message gate missing - --no-verify commits slip past "
+         "the local gate unnoticed", ["ci", "gate"]),
+        ("error", "version flag gap - log tools reject --version",
+         "error-log/decision-log/log-ai reject --version (rc 2), only diff-gate "
+         "has it", ["cli", "version"]),
+        ("error", "--init OPEN scaffold",
+         "check_errors.py --init scaffolds errors/rules/notes", ["scaffold"]),
+        ("error", "diff-gate --staged outside a git repo dumps git usage",
+         "running diff-gate --staged in a non-git directory propagates git "
+         "stderr usage text and exit code 2", ["git", "staged"]),
+        ("error", "error-log validates an unparseable log as clean",
+         "a corrupt/unparseable errors.txt reports No entries found and exits 0 "
+         "instead of failing loudly", ["log", "validation"]),
+        ("error", "interactive scaffolds abort on truncated piped stdin",
+         "interactive scaffolds abort on truncated piped stdin (error-log "
+         "--add, decision-log --decide/--revise/--resolve)", ["stdin", "scaffold"]),
+    ]
+    for mtype, title, content, tags in seeds + errors:
+        r = am.create_memory(store, mtype, title, content, tags=tags,
+                             project="p", actor="human")
+        am.promote_trust(store, r["id"], "approved", actor="human")
+    am.import_source_log(store, "rule-log", RULES_FIXTURE, project="p",
+                         actor="human")
+    for r in am.list_memories(store, mem_type="constraint"):
+        if r.get("trust") == "untrusted":
+            am.promote_trust(store, r["id"], "approved", actor="human")
+    return store
+
+
+def test_a_prime_e024_regression() -> None:
+    """A' E024 REGRESSION: on the real-content corpus (18 memories) the real
+    query 'commit message gate' recovers the AREA-MARKER rule at rank 2 - it
+    is admitted by original terms (commit, gate) and the title expansion
+    lifts it over the floor. Without expansion the rule stays below the
+    floor (mechanism proof, EVIDENCE-066 baseline)."""
+    store = _a_prime_real_corpus_store()
+    check("a': real corpus has 18 active memories",
+          len(am.list_memories(store, status="active")) == 18,
+          f"(got {len(am.list_memories(store, status='active'))})")
+    res = am.recall_memories(store, "commit message gate")
+    titles = [r["title"] for r in res]
+    check("a': E024 AREA-MARKER rule recovered by recall",
+          any("AREA-MARKER" in t for t in titles), f"(got {titles})")
+    check("a': E024 rule at rank 2 (behind the full-match memory)",
+          titles.index("THE AREA-MARKER GATE") == 1, f"(got {titles})")
+    records = [r for r in am.list_memories(store, status="active")
+               if r.get("trust") != "untrusted"]
+    terms = ["commit", "message", "gate"]
+    idf = am._idf_weights(len(records), am._term_doc_freqs(records, terms))
+    noexp = [r["title"] for r in am._rank_records(
+        records, terms, idf, floor_ratio=am.SCORE_FLOOR_RATIO, expansion=False)]
+    check("a': rule absent WITHOUT expansion (mechanism discriminates)",
+          "THE AREA-MARKER GATE" not in noexp, f"(got {noexp})")
+
+
 # 1. Schema / validation
 ERROR_LOG_FIXTURE = """================================================================================
 ERROR LOG - HOW TO USE

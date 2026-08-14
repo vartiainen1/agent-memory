@@ -85,6 +85,8 @@ def main() -> int:
         ("DEFAULT_SEARCH_LIMIT = 50", r"DEFAULT_SEARCH_LIMIT = 50"),
         ("COVERAGE_BONUS_MAX = 1.5", r"COVERAGE_BONUS_MAX = 1\.5"),
         ("TAG_EXACT_BONUS = 0.5", r"TAG_EXACT_BONUS = 0\.5"),
+        ("EXPANSION_TERMS message->title",
+         r'EXPANSION_TERMS: dict\[str, tuple\[str, \.\.\.\]\] = \{"message": \("title",\)\}'),
     ]
     spec_checks = [
         ("format_version is 1", r"format_version.*MUST be `1`", re.S),

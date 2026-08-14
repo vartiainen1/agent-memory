@@ -154,6 +154,18 @@ stronger evidence than a content substring. Both are pure functions of
 attach only to memories that already match (zero hits ⇒ zero bonus), so
 honest-zero results and the relevance floor are unchanged.
 
+`recall` also applies a **deterministic ranking-only expansion** (v0.3 A',
+EVIDENCE-068): a fixed map `EXPANSION_TERMS = {"message": ("title",)}` lets
+an alternate term (`title`) contribute an IDF-weighted hit — weighted by
+the ORIGINAL term's idf — to the text score used for ranking and the
+floor comparison. It is ranking-only by construction: candidate admission
+still reads only original-term text (an honest zero can never be rescued,
+and the candidate set never grows), the floor anchor is computed from
+original text only (expansion can never move the floor), and the T2.2
+coverage/tag bonuses, phrase bonus, path tiers, git bonus, and trust stay
+unchanged. `search` is deliberately unexpanded — operators keep full,
+original-term visibility.
+
 `--path` is a **tiered ranking signal**, not an auto-win (v0.3 T2.1): a
 memory whose path pattern covers the touched file gets a bonus by
 specificity — exact file (10) > bare directory (6) > glob/prefix (3) —
@@ -283,7 +295,7 @@ agent-memory-mcp --version
 ## Development
 
 ```bash
-python _test_agent_memory.py   # unit + CLI integration tests (394 checks)
+python _test_agent_memory.py   # unit + CLI integration tests (409 checks)
 python _audit_cli.py           # external-API audit, real binary via subprocess (173 checks)
 python _test_mcp.py            # MCP adapter: permissions, secrets, protocol (71 checks)
 ```

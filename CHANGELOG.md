@@ -5,6 +5,27 @@ top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
 ## [Unreleased]
+### Added (v0.3 A', ranking-only deterministic expansion - EVIDENCE-068/069)
+- A fixed, corpus-pure expansion map (`EXPANSION_TERMS =
+  {"message": ("title",)}`) lets recall's ranking and floor comparison see
+  IDF-weighted alternate-term hits (weighted by the ORIGINAL term's idf).
+  An applicable memory that is admitted by original terms but lexically
+  misses one query token (E024: `"commit message gate"` vs the
+  AREA-MARKER rule's "commit / PR title") can now be lifted over the
+  recall floor instead of being silently dropped.
+- Invariants held: candidate admission is unchanged (the honest-zero gate
+  reads ONLY original-term text - expansion can never create a candidate);
+  the floor anchor (best) is computed from original text only, so
+  expansion never moves the floor itself; T2.2 coverage/tag bonuses, the
+  phrase bonus, path tiers, the git bonus, trust, and tie-breaking are
+  unchanged; `search` stays unexpanded (byte-identical); determinism is
+  preserved (fixed map, no wall-clock/network/LLM).
+- Real-corpus validation (18 real memories, 23 real evidence-log queries,
+  real shipped scorer): EXACTLY ONE changed query (`"commit message gate"`
+  - the E024 target recovers THE AREA-MARKER GATE at rank 2); 22 queries
+  byte-identical, including all honest zeros and the E012/E006 controls.
+- +15 unit checks (409 total); README + drift guard updated in the same
+  commit; EVIDENCE-066/067/068 preserved as evidence history.
 ### Added (v0.3 T2.2, query-coverage + tag-exactness ranking signals - EVIDENCE-064)
 - Two bounded, deterministic TEXT scoring signals added inside the shared
   `_rank_records` (search + recall): a query-coverage bonus
