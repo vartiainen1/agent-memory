@@ -116,6 +116,37 @@ def main() -> int:
         guard(f"readme tool: {name}", f"`{name}`" in readme_text,
               f"tool {name!r} is in ALLOWED_TOOLS but missing from README")
 
+    # 3c. Verb-level contract (EVIDENCE-040 class): every sub-command
+    # "action" verb the parser implements must be documented in the SPEC
+    # 6.2 command-table row AND the README command table. The T4 docs drift
+    # (docs said `conflicts supersede`, code said `conflicts resolve`) was
+    # invisible to the top-level guard 3; this pins the verbs themselves.
+    spec_62 = re.search(r"### 6\.2 Commands(.*?)### 6\.3", spec, re.S)
+    spec_62_text = spec_62.group(1) if spec_62 else ""
+    readme_table = re.search(r"\| Command \| Purpose \|(.*?)Exit codes",
+                             readme_text, re.S)
+    readme_table_text = readme_table.group(1) if readme_table else ""
+    for amatch in re.finditer(r'add_argument\("action", choices=\(([^)]*)\)\)', code):
+        verbs = re.findall(r'"(\w+)"', amatch.group(1))
+        before = code[: amatch.start()]
+        owners = list(re.finditer(r'add_parser\("(\w+)"', before))
+        if not owners:
+            continue
+        cmd = owners[-1].group(1)
+        # Rows are single table lines; capture the WHOLE line so escaped
+        # pipes (\|) inside the flags column do not truncate the match.
+        spec_row = re.search(rf"^\|\s*`{cmd}`\s*\|.*$", spec_62_text, re.M)
+        spec_row_text = spec_row.group(0) if spec_row else ""
+        readme_row = re.search(rf"^\|\s*`{cmd}\b.*$", readme_table_text, re.M)
+        readme_row_text = readme_row.group(0) if readme_row else ""
+        for verb in verbs:
+            guard(f"spec verb: {cmd} {verb}",
+                  bool(re.search(rf"\b{verb}\b", spec_row_text)),
+                  f"verb {verb!r} of command {cmd!r} not in the SPEC 6.2 row")
+            guard(f"readme verb: {cmd} {verb}",
+                  bool(re.search(rf"\b{verb}\b", readme_row_text)),
+                  f"verb {verb!r} of command {cmd!r} not in the README command table")
+
     # 4. Python >= 3.11 in pyproject
     try:
         with open(PYPROJECT, "rb") as fh:
