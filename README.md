@@ -310,6 +310,8 @@ byte-identical determinism.
 
 v0.2 (alpha). `V0.1_SPEC.md` is the implementation contract.
 
+Sole maintainer: [vartiainen1](https://github.com/vartiainen1).
+
 ## License
 
 MIT
