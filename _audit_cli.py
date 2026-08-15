@@ -887,7 +887,7 @@ def audit_json_errors_and_meta():
 
     # meta
     r = p.run("--version")
-    ok("--version exit 0 + value", r.returncode == 0 and "agent-memory 0.1.0" in r.stdout, r.stdout)
+    ok("--version exit 0 + value", r.returncode == 0 and "agent-memory 0.2.0" in r.stdout, r.stdout)
     r = p.run("--help")
     ok("--help exit 0", r.returncode == 0 and "usage" in r.stdout.lower(), f"rc={r.returncode}")
     r = p.run("frobnicate")

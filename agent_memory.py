@@ -45,7 +45,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     tomllib = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # --------------------------------------------------------------------------
 # Constants (from V0.1_SPEC.md)

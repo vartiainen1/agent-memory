@@ -41,4 +41,4 @@ agent-memory-mcp = "agent_memory_mcp:main"
 py-modules = ["agent_memory", "agent_memory_mcp"]
 
 [tool.setuptools_scm]
-fallback_version = "0.1.0"
+fallback_version = "0.2.0"

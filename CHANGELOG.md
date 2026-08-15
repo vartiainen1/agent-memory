@@ -4,7 +4,7 @@ All notable changes to agent-memory are documented here. The version at the
 top of this file is the single source of truth for releases (the Release
 workflow tags whatever the top `## [X.Y.Z]` header says).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-15
 ### Added (v0.3 A', ranking-only deterministic expansion - EVIDENCE-068/069)
 - A fixed, corpus-pure expansion map (`EXPANSION_TERMS =
   {"message": ("title",)}`) lets recall's ranking and floor comparison see

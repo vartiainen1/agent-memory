@@ -62,7 +62,7 @@ pip install .[mcp]
 Verify:
 
 ```bash
-agent-memory --version   # agent-memory 0.1.0
+agent-memory --version   # agent-memory 0.2.0
 ```
 
 ## Quickstart
@@ -308,7 +308,7 @@ byte-identical determinism.
 
 ## Status
 
-v0.1 (alpha). `V0.1_SPEC.md` is the implementation contract.
+v0.2 (alpha). `V0.1_SPEC.md` is the implementation contract.
 
 ## License
 
