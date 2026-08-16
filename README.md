@@ -253,9 +253,10 @@ decision-log ─┼──▶ agent-memory ──recall──▶ AI agent ──p
                         └───────── constraints ───┴─────────────────────▶ PASS / BLOCK
 ```
 
-(Import of the family logs into agent-memory is v0.2; v0.1 ships
-provenance/fingerprint fields schema-ready but unpopulated, and seeding is
-manual via `add --provenance import`.)
+(Family import ships in v0.2: `import PATH --source
+error-log|decision-log|lesson-log|rule-log` ingests the sibling logs as
+untrusted, provenance-tracked, fingerprint-deduped memories; seeding can
+also be done manually via `add --provenance import`.)
 
 ## Agent interface (MCP, v0.3 Tier 1)
 
@@ -308,7 +309,7 @@ byte-identical determinism.
 
 ## Status
 
-v0.2 (alpha). `V0.1_SPEC.md` is the implementation contract.
+v0.2.0. `V0.1_SPEC.md` is the implementation contract.
 
 Sole maintainer: [vartiainen1](https://github.com/vartiainen1).
 
